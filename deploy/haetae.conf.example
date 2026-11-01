@@ -1,0 +1,61 @@
+# /etc/haetae/haetae.conf : Haetae configuration (example, every key with its default unless noted)
+#
+# Format : "key = value" under a [section]. Everything after # is a comment.
+# Lists are comma separated; a value ending in a comma continues on the next line.
+# A missing key = default. Command line options win over this file.
+# Unknown key / duplicate key / invalid value = Haetae refuses to start (a typo must not empty an allow list).
+# Read by : haetae -c <file>, otherwise this file (/etc/haetae/haetae.conf) if it exists. Daemon mode only.
+# After a change : sudo systemctl reload haetae -> journalctl -u haetae -n 5 shows each changed key (old -> new).
+#   Keys marked (restart) keep their current value on reload (with a warning) and need a restart.
+#   If the file is invalid or missing on reload, nothing changes and Haetae keeps running with the current values.
+
+
+[paths]
+cache = /var/lib/haetae/cache        # fetched objects (file tree shaped like rsync URIs) (restart)   option -cache
+out   = /var/lib/haetae/out          # output : json, csv, objects.jsonl, rejects.txt (restart)      option -o
+state = /var/lib/haetae/state        # lock, RTR session / serial, deltas, history (restart)         option -state
+tal   =                              # empty = the 5 RIR TALs built into the binary (repo tals/)     option -tal
+                                     #   give a folder only for an emergency TA key change
+slurm =                              # SLURM local exceptions file (RFC 8416). empty = none          option -slurm
+                                     #   e.g. /etc/haetae/slurm.json
+
+
+[fetch]
+interval = 10m                       # cycle interval (fetch + validate)                             option -interval
+jobs     = 32                        # repositories fetched at the same time                         option -fetch-j
+rsync    = true                      # fall back to rsync when RRDP keeps failing                    option -norsync (= false)
+
+
+[validation]
+workers       = 32                   # validation workers (default = number of CPUs)                 option -j
+drop-warn     = 0.1                  # warn when VRPs drop by more than this fraction                option -drop-warn
+hold-drop     = false                # on such a drop, keep serving the previous VRPs                option -hold-drop
+max-start-age = 2h                   # on restart, serve the saved VRPs at once if newer (restart)   option -max-start-age
+
+
+[rtr]
+listen  = :3323                      # RTR address. empty = closed (restart)                         option -rtr
+allow   = 127.0.0.1, ::1,            # allowed router addresses / prefixes                           option -rtr-allow
+          192.0.2.1                  #   example router
+auth    =                            # TCP-MD5 / TCP-AO key file. empty = plain TCP (restart)        option -rtr-auth
+                                     #   e.g. /etc/haetae/rtr-auth.conf (docs/manual.md)
+refresh = 600                        # refresh interval sent to routers (seconds, 1..86400)          option -rtr-refresh
+retry   = 300                        # retry interval (seconds, 1..7200)                             option -rtr-retry
+expire  = 7200                       # expire interval (seconds, 600..172800)                        option -rtr-expire
+
+
+[rtr-tls]
+listen =                             # RTR over TLS address. empty = closed, e.g. :3324 (restart)    option -rtr-tls
+cert   =                             # server certificate (PEM)                                      option -rtr-tls-cert
+key    =                             # server key (PEM)                                              option -rtr-tls-key
+ca     =                             # CA for router certificates. if set, routers must present one  option -rtr-tls-ca
+
+
+[http]
+listen = 127.0.0.1:8323,             # API addresses (default 127.0.0.1:8323) (restart)             option -http
+         0.0.0.0:8324                #   example second address for other hosts
+allow  = 127.0.0.1, ::1,             # allowed client addresses, applies to every listen, else 403   option -http-allow
+         198.51.100.0/24             #   example management network
+jsonext             = false          # open /jsonext (large, about 5 s / 470 MB per call)            option -jsonext
+delta-full-interval = 1m             # full /json-delta at most once per client in this interval     option -delta-full-interval
+                                     #   0 = no limit

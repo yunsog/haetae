@@ -1,0 +1,552 @@
+package main
+
+// vrp.go : 라우터 / API 에 주는 데이터 집합과 serial, 변경분 (delta)
+//
+// 한 회차 검증이 끝나면 payloadSet (VRP + 라우터 키 + ASPA) 을 새로 만들고
+// 직전 집합과 비교해 바뀐 것 (announce / withdraw) 을 delta 로 보관 -> serial + 1.
+// RTR Serial Query, VRP API "바뀐 것" (E5) 이 이 delta 를 씀.
+// RTR 에는 TA 구분이 없으므로 (prefix, maxLength, ASN) 이 같으면 하나로 침.
+
+import (
+	"bytes"
+	"encoding/base64"
+	"encoding/gob"
+	"encoding/hex"
+	"encoding/json"
+	"fmt"
+	"net/netip"
+	"os"
+	"sort"
+	"sync"
+	"time"
+)
+
+// 보관할 delta 수 (10 분 주기면 약 하루 + 여유)
+const maxDeltaHistory = 200
+
+// rtrVRP : RTR 단위 VRP (TA 없음)
+type rtrVRP struct {
+	Prefix    netip.Prefix
+	MaxLength uint8
+	ASN       uint32
+}
+
+// rtrKey : 라우터 키
+type rtrKey struct {
+	SKI  [20]byte
+	ASN  uint32
+	SPKI string // DER (map key 로 쓰려고 string)
+}
+
+// payloadSet : 한 시점의 전체 (불변, 만든 뒤 바꾸지 않음)
+type payloadSet struct {
+	VRPs  map[rtrVRP]bool
+	Keys  map[rtrKey]bool
+	ASPAs map[uint32][]uint32 // customer -> providers (오름차순, TA 합침)
+
+	// API / JSON 용 (TA 포함 원본)
+	Full     []vrpKey
+	FullExp  map[vrpKey]time.Time
+	Built    time.Time // 검증 시각
+	TAs      []string
+	FailedTA []string
+
+	Filtered slurmCounts // SLURM 으로 뺀 수
+
+	idxOnce sync.Once
+	idx     map[netip.Prefix][]rtrVRP // prefix -> VRP (경로 검증 조회용, 처음 쓸 때 만듦)
+
+	sortOnce sync.Once
+	sorted   []rtrVRP // 정렬된 VRP (json-delta 전체, 처음 쓸 때 만듦)
+}
+
+// slurmCounts : SLURM 적용 수
+type slurmCounts struct {
+	VRPs       int `json:"vrps"`
+	RouterKeys int `json:"router_keys"`
+	ASPAs      int `json:"aspas"`
+}
+
+// sortedVRPs : 주소, prefix 길이, maxLength, ASN 순
+func (p *payloadSet) sortedVRPs() []rtrVRP {
+	p.sortOnce.Do(func() {
+		p.sorted = make([]rtrVRP, 0, len(p.VRPs))
+		for v := range p.VRPs {
+			p.sorted = append(p.sorted, v)
+		}
+		sortRTRVRPs(p.sorted)
+	})
+	return p.sorted
+}
+
+func sortRTRVRPs(vs []rtrVRP) {
+	sort.Slice(vs, func(i, j int) bool {
+		a, b := vs[i], vs[j]
+		if c := a.Prefix.Addr().Compare(b.Prefix.Addr()); c != 0 {
+			return c < 0
+		}
+		if a.Prefix.Bits() != b.Prefix.Bits() {
+			return a.Prefix.Bits() < b.Prefix.Bits()
+		}
+		if a.MaxLength != b.MaxLength {
+			return a.MaxLength < b.MaxLength
+		}
+		return a.ASN < b.ASN
+	})
+}
+
+// index : 같은 prefix 의 VRP 묶음 (조회 때 prefix 길이마다 한 번씩 찾음)
+func (p *payloadSet) index() map[netip.Prefix][]rtrVRP {
+	p.idxOnce.Do(func() {
+		p.idx = make(map[netip.Prefix][]rtrVRP, len(p.VRPs))
+		for v := range p.VRPs {
+			p.idx[v.Prefix] = append(p.idx[v.Prefix], v)
+		}
+	})
+	return p.idx
+}
+
+// delta : serial 하나만큼의 변화
+type delta struct {
+	Serial    uint32
+	AnnVRP    []rtrVRP
+	WdrVRP    []rtrVRP
+	AnnKey    []rtrKey
+	WdrKey    []rtrKey
+	ASPAChg   []uint32 // 바뀐 customer (지금 값은 새 집합에서, 없으면 withdraw)
+	Time      time.Time
+	OldASPAOf map[uint32][]uint32
+}
+
+// store : 지금 집합 + session + serial + delta 기록 (RTR / API 가 같이 읽음)
+type store struct {
+	mu      sync.RWMutex
+	Session uint16
+	Serial  uint32
+	Cur     *payloadSet
+	History []delta // 오래된 것부터
+	Updated time.Time
+
+	listeners []chan struct{} // 바뀌면 알림 (RTR Serial Notify)
+}
+
+// newPayloadSet : 검증 결과 -> payloadSet
+func newPayloadSet(v *validator, slurm *slurmFile) *payloadSet {
+	p := &payloadSet{
+		VRPs:     map[rtrVRP]bool{},
+		Keys:     map[rtrKey]bool{},
+		ASPAs:    map[uint32][]uint32{},
+		FullExp:  map[vrpKey]time.Time{},
+		Built:    v.Now,
+		FailedTA: v.failedTA,
+	}
+	for k, exp := range v.vrps {
+		if slurm.filterVRP(k.ASN, k.Prefix) {
+			p.Filtered.VRPs++
+			continue
+		}
+		p.Full = append(p.Full, k)
+		p.FullExp[k] = exp
+		p.VRPs[rtrVRP{k.Prefix, uint8(k.MaxLength), k.ASN}] = true
+	}
+	for _, r := range v.rkeys {
+		if slurm.filterKey(r.ASN, r.SKI) {
+			p.Filtered.RouterKeys++
+			continue
+		}
+		var k rtrKey
+		copy(k.SKI[:], r.SKI)
+		k.ASN, k.SPKI = r.ASN, string(r.SPKI)
+		p.Keys[k] = true
+	}
+	merged := map[uint32]map[uint32]bool{}
+	for k, a := range v.aspas {
+		if slurm.filterASPA(k.Customer) {
+			p.Filtered.ASPAs++
+			continue
+		}
+		if merged[k.Customer] == nil {
+			merged[k.Customer] = map[uint32]bool{}
+		}
+		for pr := range a.Providers {
+			merged[k.Customer][pr] = true
+		}
+	}
+	for c, ps := range merged {
+		p.ASPAs[c] = sortedASNs(ps)
+	}
+	slurm.addAssertions(p)
+	sort.Slice(p.Full, func(i, j int) bool { return lessVRPKey(p.Full[i], p.Full[j]) })
+	return p
+}
+
+func sortedASNs(m map[uint32]bool) []uint32 {
+	out := make([]uint32, 0, len(m))
+	for a := range m {
+		out = append(out, a)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i] < out[j] })
+	return out
+}
+
+func lessVRPKey(a, b vrpKey) bool {
+	if c := a.Prefix.Addr().Compare(b.Prefix.Addr()); c != 0 {
+		return c < 0
+	}
+	if a.Prefix.Bits() != b.Prefix.Bits() {
+		return a.Prefix.Bits() < b.Prefix.Bits()
+	}
+	if a.MaxLength != b.MaxLength {
+		return a.MaxLength < b.MaxLength
+	}
+	if a.ASN != b.ASN {
+		return a.ASN < b.ASN
+	}
+	return a.TA < b.TA
+}
+
+func equalASNs(a, b []uint32) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
+// diffSets : old -> new 변화 (old 가 nil 이면 전부 announce)
+func diffSets(old, nw *payloadSet) delta {
+	var d delta
+	if old == nil {
+		old = &payloadSet{VRPs: map[rtrVRP]bool{}, Keys: map[rtrKey]bool{}, ASPAs: map[uint32][]uint32{}}
+	}
+	for k := range nw.VRPs {
+		if !old.VRPs[k] {
+			d.AnnVRP = append(d.AnnVRP, k)
+		}
+	}
+	for k := range old.VRPs {
+		if !nw.VRPs[k] {
+			d.WdrVRP = append(d.WdrVRP, k)
+		}
+	}
+	for k := range nw.Keys {
+		if !old.Keys[k] {
+			d.AnnKey = append(d.AnnKey, k)
+		}
+	}
+	for k := range old.Keys {
+		if !nw.Keys[k] {
+			d.WdrKey = append(d.WdrKey, k)
+		}
+	}
+	d.OldASPAOf = map[uint32][]uint32{}
+	for c, ps := range nw.ASPAs {
+		if op, ok := old.ASPAs[c]; !ok || !equalASNs(op, ps) {
+			d.ASPAChg = append(d.ASPAChg, c)
+			d.OldASPAOf[c] = op
+		}
+	}
+	for c, op := range old.ASPAs {
+		if _, ok := nw.ASPAs[c]; !ok {
+			d.ASPAChg = append(d.ASPAChg, c)
+			d.OldASPAOf[c] = op
+		}
+	}
+	sort.Slice(d.ASPAChg, func(i, j int) bool { return d.ASPAChg[i] < d.ASPAChg[j] })
+	return d
+}
+
+func (d *delta) empty() bool {
+	return len(d.AnnVRP)+len(d.WdrVRP)+len(d.AnnKey)+len(d.WdrKey)+len(d.ASPAChg) == 0
+}
+
+// update : 새 집합으로 바꿈. 바뀐 것이 있으면 serial + 1, delta 보관, 알림
+func (s *store) update(nw *payloadSet) (delta, bool) {
+	s.mu.Lock()
+	d := diffSets(s.Cur, nw)
+	first := s.Cur == nil
+	s.Cur = nw
+	s.Updated = time.Now()
+	changed := !d.empty() && !first
+	if changed {
+		s.Serial++ // uint32 이므로 넘치면 0 (RFC 1982 serial 산술)
+		d.Serial = s.Serial
+		d.Time = time.Now()
+		s.History = append(s.History, d)
+		if len(s.History) > maxDeltaHistory {
+			s.History = s.History[len(s.History)-maxDeltaHistory:]
+		}
+	}
+	ls := append([]chan struct{}(nil), s.listeners...)
+	s.mu.Unlock()
+	if changed {
+		for _, l := range ls {
+			select {
+			case l <- struct{}{}:
+			default:
+			}
+		}
+	}
+	return d, changed
+}
+
+func (s *store) subscribe() chan struct{} {
+	ch := make(chan struct{}, 1)
+	s.mu.Lock()
+	s.listeners = append(s.listeners, ch)
+	s.mu.Unlock()
+	return ch
+}
+
+func (s *store) unsubscribe(ch chan struct{}) {
+	s.mu.Lock()
+	for i, l := range s.listeners {
+		if l == ch {
+			s.listeners = append(s.listeners[:i], s.listeners[i+1:]...)
+			break
+		}
+	}
+	s.mu.Unlock()
+}
+
+// netDiff : from (클라이언트가 가진 serial) 이후 지금까지 합친 변화. 기록이 없으면 ok=false (Cache Reset)
+// 호출하는 쪽이 RLock 을 잡고 있어야 함
+func (s *store) netDiff(from uint32) (ann, wdr []rtrVRP, kAnn, kWdr []rtrKey, aspaChg []uint32, ok bool) {
+	return s.netDiffTo(from, s.Serial)
+}
+
+// netDiffTo : from 이후 to 까지 합친 변화 (to = 지금이면 netDiff). to 까지의 기록이 없으면 ok=false
+func (s *store) netDiffTo(from, to uint32) (ann, wdr []rtrVRP, kAnn, kWdr []rtrKey, aspaChg []uint32, ok bool) {
+	if from == to && to == s.Serial {
+		return nil, nil, nil, nil, nil, true
+	}
+	start, end := -1, -1
+	for i, d := range s.History {
+		if d.Serial == from+1 {
+			start = i
+		}
+		if d.Serial == to {
+			end = i
+		}
+	}
+	if start < 0 || end < start {
+		return nil, nil, nil, nil, nil, false
+	}
+	// 순서대로 겹쳐서 최종 상태만 남김 (announce 뒤 withdraw = 없던 일)
+	vs := map[rtrVRP]bool{} // true = announce, false = withdraw
+	ks := map[rtrKey]bool{}
+	as := map[uint32]bool{}
+	for _, d := range s.History[start : end+1] {
+		for _, k := range d.AnnVRP {
+			if a, seen := vs[k]; seen && !a {
+				delete(vs, k)
+			} else {
+				vs[k] = true
+			}
+		}
+		for _, k := range d.WdrVRP {
+			if a, seen := vs[k]; seen && a {
+				delete(vs, k)
+			} else {
+				vs[k] = false
+			}
+		}
+		for _, k := range d.AnnKey {
+			if a, seen := ks[k]; seen && !a {
+				delete(ks, k)
+			} else {
+				ks[k] = true
+			}
+		}
+		for _, k := range d.WdrKey {
+			if a, seen := ks[k]; seen && a {
+				delete(ks, k)
+			} else {
+				ks[k] = false
+			}
+		}
+		for _, c := range d.ASPAChg {
+			as[c] = true
+		}
+	}
+	for k, a := range vs {
+		if a {
+			ann = append(ann, k)
+		} else {
+			wdr = append(wdr, k)
+		}
+	}
+	for k, a := range ks {
+		if a {
+			kAnn = append(kAnn, k)
+		} else {
+			kWdr = append(kWdr, k)
+		}
+	}
+	for c := range as {
+		aspaChg = append(aspaChg, c)
+	}
+	sort.Slice(aspaChg, func(i, j int) bool { return aspaChg[i] < aspaChg[j] })
+	return ann, wdr, kAnn, kWdr, aspaChg, true
+}
+
+// aspaAt : serial to 시점의 customer c 의 provider 목록 (nil = 없음). RLock 필요
+// to 뒤에 c 를 처음 바꾼 delta 의 "바뀌기 전" 값, 그런 delta 가 없으면 지금 값
+func (s *store) aspaAt(c, to uint32) []uint32 {
+	for _, d := range s.History {
+		if d.Serial <= to {
+			continue
+		}
+		if old, ok := d.OldASPAOf[c]; ok {
+			return old
+		}
+	}
+	return s.Cur.ASPAs[c]
+}
+
+// ---- 재시작 대비 저장 (C4, B5) ----
+
+// savedDeltas : delta 기록 (deltas.gob). 재시작 뒤에도 RTR Serial Query / json-delta 가 이어지게
+type savedDeltas struct {
+	Session uint16
+	Serial  uint32
+	History []delta
+}
+
+func saveDeltas(path string, s *store) error {
+	s.mu.RLock()
+	sd := savedDeltas{s.Session, s.Serial, s.History}
+	var buf bytes.Buffer
+	err := gob.NewEncoder(&buf).Encode(&sd)
+	s.mu.RUnlock()
+	if err != nil {
+		return err
+	}
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, buf.Bytes(), 0644); err != nil {
+		return err
+	}
+	return os.Rename(tmp, path)
+}
+
+// loadDeltas : session / serial 이 지금 상태와 같을 때만 기록을 씀
+func loadDeltas(path string, session uint16, serial uint32) ([]delta, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	var sd savedDeltas
+	if err := gob.NewDecoder(f).Decode(&sd); err != nil {
+		return nil, err
+	}
+	if sd.Session != session || sd.Serial != serial {
+		return nil, fmt.Errorf("session / serial %d / %d differs from state %d / %d", sd.Session, sd.Serial, session, serial)
+	}
+	return sd.History, nil
+}
+
+// rtrState : session / serial (state.json)
+type rtrState struct {
+	Session uint16    `json:"session"`
+	Serial  uint32    `json:"serial"`
+	Saved   time.Time `json:"saved"`
+}
+
+func saveRTRState(path string, s *store) error {
+	s.mu.RLock()
+	st := rtrState{s.Session, s.Serial, time.Now()}
+	s.mu.RUnlock()
+	b, _ := json.MarshalIndent(st, "", " ")
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, b, 0644); err != nil {
+		return err
+	}
+	return os.Rename(tmp, path)
+}
+
+func loadRTRState(path string) (*rtrState, error) {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	var st rtrState
+	return &st, json.Unmarshal(b, &st)
+}
+
+// loadPayloadJSON : 직전 출력 json (output.go 형식) 에서 payloadSet 복원 (재시작 빠른 시작, C3)
+func loadPayloadJSON(path string) (*payloadSet, error) {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	var j struct {
+		Metadata struct {
+			Evaltime string `json:"evaltime"`
+		} `json:"metadata"`
+		Roas []struct {
+			ASN       uint32 `json:"asn"`
+			Prefix    string `json:"prefix"`
+			MaxLength int    `json:"maxLength"`
+			TA        string `json:"ta"`
+			Expires   int64  `json:"expires"`
+		} `json:"roas"`
+		Aspas []struct {
+			Customer  uint32   `json:"customer_asid"`
+			Providers []uint32 `json:"providers"`
+		} `json:"aspas"`
+		Keys []struct {
+			ASN    uint32 `json:"asn"`
+			SKI    string `json:"ski"`
+			Pubkey string `json:"pubkey"`
+		} `json:"bgpsec_keys"`
+	}
+	if err := json.Unmarshal(b, &j); err != nil {
+		return nil, err
+	}
+	built, err := time.Parse("2006-01-02T15:04:05Z", j.Metadata.Evaltime)
+	if err != nil {
+		return nil, fmt.Errorf("evaltime: %w", err)
+	}
+	p := &payloadSet{VRPs: map[rtrVRP]bool{}, Keys: map[rtrKey]bool{}, ASPAs: map[uint32][]uint32{},
+		FullExp: map[vrpKey]time.Time{}, Built: built}
+	for _, r := range j.Roas {
+		pf, err := netip.ParsePrefix(r.Prefix)
+		if err != nil {
+			return nil, err
+		}
+		k := vrpKey{r.ASN, pf, r.MaxLength, r.TA}
+		p.Full = append(p.Full, k)
+		p.FullExp[k] = time.Unix(r.Expires, 0)
+		p.VRPs[rtrVRP{pf, uint8(r.MaxLength), r.ASN}] = true
+	}
+	for _, a := range j.Aspas {
+		m := map[uint32]bool{}
+		for _, x := range p.ASPAs[a.Customer] {
+			m[x] = true
+		}
+		for _, x := range a.Providers {
+			m[x] = true
+		}
+		p.ASPAs[a.Customer] = sortedASNs(m)
+	}
+	for _, r := range j.Keys {
+		var k rtrKey
+		ski, err := hex.DecodeString(r.SKI)
+		if err != nil || len(ski) != 20 {
+			return nil, fmt.Errorf("bad ski")
+		}
+		spki, err := base64.StdEncoding.DecodeString(r.Pubkey)
+		if err != nil {
+			return nil, err
+		}
+		copy(k.SKI[:], ski)
+		k.ASN, k.SPKI = r.ASN, string(spki)
+		p.Keys[k] = true
+	}
+	return p, nil
+}

@@ -1,0 +1,31 @@
+# Haetae 상주 (systemd, 전용 계정 haetae, /var/lib/haetae 만 쓰기)
+# 설정은 /etc/haetae/haetae.conf (예 deploy/haetae.conf.example). TAL 은 실행 파일 안 (저장소 tals/)
+# 설치 : docs/manual.md
+[Unit]
+Description=Haetae RPKI Relying Party
+# A5 : 시계가 맞아야 함 (틀리면 전부 만료 판정)
+After=network-online.target time-sync.target
+Wants=network-online.target
+
+[Service]
+User=haetae
+Group=haetae
+StateDirectory=haetae
+# 옵션은 모두 설정 파일에서 (명령줄 옵션을 붙이면 그것이 우선)
+ExecStart=/usr/local/bin/haetae
+# systemctl reload haetae = 설정 파일 다시 읽기 (재시작 아님, reload.go). 듣는 주소 / 폴더 등은 restart 해야 바뀜
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=on-failure
+RestartSec=30
+# 보호
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ReadWritePaths=/var/lib/haetae
+# 한 회차 실제 사용 (anon) 약 5 GB + 파일 캐시. 8G 면 파일 캐시로 swap 을 씀
+MemoryMax=12G
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target
