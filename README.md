@@ -7,7 +7,7 @@ repositories of the five RIRs, validates every published object and serves the
 result to routers over RTR and to other systems over an HTTP API.
 
 The name comes from the *haetae* (해태), a mythical guardian in Korean tradition
-that tells right from wrong.
+that tells right from wrong. This one checks whether a route is telling the truth.
 
 Haetae 0.2.0 runs in a test deployment alongside other RPs, serving a test router
 over RTR. It is new software: please run it next to an established RP and compare
