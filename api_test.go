@@ -7,6 +7,8 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/netip"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -59,8 +61,14 @@ func testDaemon(t *testing.T) *daemon {
 		Summary: map[string]any{"asn": uint32(13335), "prefixes": []roaPrefixOut{{netip.MustParsePrefix("1.1.1.0/24"), 24}}}}
 	asa := objInfo{Type: "asa", URI: "rsync://x/b.asa", TA: "ripe", Status: "valid", NotAfter: time.Now().Add(100 * 24 * time.Hour),
 		Summary: map[string]any{"customer": uint32(64500), "providers": []uint32{174}}}
+	// 인증서 : 라우터 (정상 / 거부), CA (11-02 kind 조건)
+	rtr := objInfo{Type: "cer", URI: "rsync://x/r.cer", TA: "arin", Status: "valid",
+		Summary: map[string]any{"kind": "router", "asns": []uint32{65001}, "ski": "AB"}}
+	rtrBad := objInfo{Type: "cer", URI: "rsync://x/r2.cer", TA: "arin", Status: "rejected", Reason: "certificate has expired",
+		Summary: map[string]any{"kind": "router"}}
+	ca := objInfo{Type: "cer", URI: "rsync://x/c.cer", TA: "arin", Status: "valid", Summary: map[string]any{"kind": "CA"}}
 	d.view = &queryView{
-		Objects: []objInfo{roa, asa},
+		Objects: []objInfo{roa, asa, rtr, rtrBad, ca},
 		VRPSrc:  map[vrpKey][]vrpSource{full[0]: {{URI: roa.URI, TA: "apnic"}}},
 		ASPAs:   map[aspaKey]*aspaOut{},
 	}
@@ -194,6 +202,17 @@ func TestAPIObjects(t *testing.T) {
 	if m["total"].(float64) != 1 {
 		t.Errorf("objects as total %v", m["total"])
 	}
+	_, m = get(t, h, "GET", "/api/v1/objects?kind=router", "")
+	if m["total"].(float64) != 2 {
+		t.Errorf("objects kind=router total %v", m["total"])
+	}
+	_, m = get(t, h, "GET", "/api/v1/objects?kind=router&status=rejected", "")
+	if m["total"].(float64) != 1 {
+		t.Errorf("objects kind=router rejected total %v", m["total"])
+	}
+	if code, _ := get(t, h, "GET", "/api/v1/objects?kind=ee", ""); code != 400 {
+		t.Errorf("objects kind=ee: %d, want 400", code)
+	}
 	_, m = get(t, h, "GET", "/api/v1/expiring?days=7", "")
 	if m["total"].(float64) != 1 {
 		t.Errorf("expiring total %v", m["total"])
@@ -255,10 +274,24 @@ func TestHistory(t *testing.T) {
 	if n := len(m["runs"].([]any)); n != 30 {
 		t.Errorf("history runs %d", n)
 	}
+	// /metrics 이름 관례 (11-02) : build_info, 시각 = _timestamp_seconds, 반영 안 한 회차 = 이유별 counter, 바이트 원값
+	d.mu.Lock()
+	d.last = &runInfo{Start: time.Now(), Bytes: 1234567, Reason: "TA failed [ripe], keep previous"}
+	d.countNotApplied(d.last)
+	d.countNotApplied(&runInfo{Reason: "SLURM x: bad, keep previous"})
+	d.mu.Unlock()
 	rec := httptest.NewRecorder()
 	d.apiHandler().ServeHTTP(rec, httptest.NewRequest("GET", "/metrics", nil))
-	if !strings.Contains(rec.Body.String(), "haetae_vrps 5") {
-		t.Errorf("metrics:\n%s", rec.Body.String())
+	body := rec.Body.String()
+	for _, want := range []string{"haetae_vrps 5", `haetae_build_info{goversion="`, `version="` + version + `"} 1`, "haetae_data_timestamp_seconds ",
+		`haetae_runs_not_applied_total{reason="ta_failed"} 1`, `haetae_runs_not_applied_total{reason="slurm"} 1`,
+		"haetae_last_run_downloaded_bytes 1234567", "haetae_handovers_total 0"} {
+		if !strings.Contains(body, want) {
+			t.Errorf("metrics: no %q\n%s", want, body)
+		}
+	}
+	if strings.Contains(body, "haetae_data_time_seconds") {
+		t.Error("old metric name still there")
 	}
 }
 
@@ -313,5 +346,92 @@ func TestSaveLoadDeltas(t *testing.T) {
 	}
 	if _, err := loadDeltas(p, 8, 1); err == nil {
 		t.Error("other session accepted")
+	}
+}
+
+// TAL / SLURM 오류로 검증을 못 한 회차도 상태와 이력에 남고, 개수는 지금 집합 그대로. SLURM 오류는 상태 slurm.error
+func TestSkipRun(t *testing.T) {
+	d := testDaemon(t)
+	d.cfg.TALDir = t.TempDir() // TAL 없음
+	d.cycle()
+	if d.last == nil || d.last.Applied || !strings.HasPrefix(d.last.Reason, "TAL:") || d.runs != 1 || d.last.VRPs == 0 {
+		t.Fatalf("TAL error run: %+v runs %d", d.last, d.runs)
+	}
+	d.cfg.TALDir = ""
+	d.cfg.SLURM = filepath.Join(t.TempDir(), "missing.json")
+	d.cycle()
+	if d.last.Applied || !strings.HasPrefix(d.last.Reason, "SLURM") || d.runs != 2 {
+		t.Fatalf("SLURM error run: %+v", d.last)
+	}
+	sl, _ := d.statusData(false)["slurm"].(map[string]any)
+	if sl == nil || sl["error"] == nil {
+		t.Errorf("status slurm: %v", sl)
+	}
+	if len(d.hist) != 2 {
+		t.Errorf("history %d", len(d.hist))
+	}
+}
+
+// 재시작 복원 : payload.gob 에 쓴 것과 읽은 것이 같고, 오래되면 새 session (옛 것과 다름), 없으면 옛 방식 / 새 session
+func TestSaveLoadState(t *testing.T) {
+	d := testDaemon(t)
+	d.st.mu.Lock()
+	d.st.Cur.Built = time.Now()
+	d.st.mu.Unlock()
+	gp := filepath.Join(d.cfg.StateDir, "payload.gob")
+	if err := saveState(gp, d.st); err != nil {
+		t.Fatal(err)
+	}
+	ss, p, err := loadSavedState(gp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cur := d.st.Cur
+	if ss.Session != 7 || ss.Serial != d.st.Serial || len(ss.History) != len(d.st.History) {
+		t.Errorf("session %d serial %d history %d", ss.Session, ss.Serial, len(ss.History))
+	}
+	if len(p.VRPs) != len(cur.VRPs) || len(p.Full) != len(cur.Full) || len(p.ASPAs) != len(cur.ASPAs) {
+		t.Errorf("set differs: vrps %d/%d full %d/%d aspas %d/%d", len(p.VRPs), len(cur.VRPs), len(p.Full), len(cur.Full), len(p.ASPAs), len(cur.ASPAs))
+	}
+	for v := range cur.VRPs {
+		if !p.VRPs[v] {
+			t.Errorf("missing %v", v)
+		}
+	}
+	for _, k := range cur.Full {
+		if !p.FullExp[k].Equal(cur.FullExp[k].Truncate(time.Second)) {
+			t.Errorf("exp %v: %v vs %v", k, p.FullExp[k], cur.FullExp[k])
+		}
+	}
+	if d2 := diffSets(cur, p); !d2.empty() {
+		t.Errorf("diff after reload: %+v", d2)
+	}
+
+	// 데몬 시작 : 새것이면 그대로 이어감
+	nd := &daemon{cfg: daemonConfig{StateDir: d.cfg.StateDir, OutDir: t.TempDir(), MaxStartAge: time.Hour}, st: &store{}}
+	nd.loadState()
+	if nd.st.Session != 7 || nd.st.Serial != d.st.Serial || nd.st.Cur == nil || len(nd.st.History) != len(d.st.History) {
+		t.Errorf("restore: session %d serial %d", nd.st.Session, nd.st.Serial)
+	}
+	// 오래됨 -> 새 session (옛 것과 다름), 집합 없음
+	od := &daemon{cfg: daemonConfig{StateDir: d.cfg.StateDir, OutDir: t.TempDir(), MaxStartAge: 0}, st: &store{}}
+	od.loadState()
+	if od.st.Session == 7 || od.st.Cur != nil {
+		t.Errorf("too old: session %d cur %v", od.st.Session, od.st.Cur != nil)
+	}
+	// 깨진 파일 -> 새 session
+	os.WriteFile(gp, []byte("broken"), 0644)
+	bd := &daemon{cfg: daemonConfig{StateDir: d.cfg.StateDir, OutDir: t.TempDir(), MaxStartAge: time.Hour}, st: &store{}}
+	bd.loadState()
+	if bd.st.Cur != nil {
+		t.Error("broken file restored")
+	}
+}
+
+func TestNewSessionDiffers(t *testing.T) {
+	for i := 0; i < 1000; i++ {
+		if newSession(uint16(i)) == uint16(i) {
+			t.Fatal("same session")
+		}
 	}
 }

@@ -48,15 +48,13 @@ func parseASN(s string) (uint32, error) {
 	return uint32(n), err
 }
 
-// current : 지금 집합과 조회용 결과
+// current : 지금 집합과 조회용 결과 (언제나 같은 회차 : cycle 이 d.mu 안에서 둘을 같이 바꿈). 잠금 순서 d.mu -> st.mu
 func (d *daemon) current() (*payloadSet, *queryView) {
-	d.st.mu.RLock()
-	cur := d.st.Cur
-	d.st.mu.RUnlock()
 	d.mu.Lock()
-	view := d.view
-	d.mu.Unlock()
-	return cur, view
+	defer d.mu.Unlock()
+	d.st.mu.RLock()
+	defer d.st.mu.RUnlock()
+	return d.st.Cur, d.view
 }
 
 func noData(w http.ResponseWriter) {
@@ -304,7 +302,7 @@ func (d *daemon) handleJSONDelta(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if !ok {
-		if wait := d.fullDeltaWait(r.RemoteAddr); wait > 0 {
+		if wait := d.clientWait("/json-delta full", r.RemoteAddr); wait > 0 {
 			sec := int((wait + time.Second - 1) / time.Second)
 			w.Header().Set("Retry-After", strconv.Itoa(sec))
 			http.Error(w, fmt.Sprintf("full set (reset) allowed once per %s per client, retry after %d s",
@@ -385,17 +383,14 @@ func (d *daemon) handleJSONDelta(w http.ResponseWriter, r *http.Request) {
 	bw.WriteString("]}\n")
 }
 
-// fullDeltaWait : 이 주소가 전체를 받아도 되면 0 (그리고 지금 시각을 기록), 아니면 남은 시간
-// 간격 0 = 제한 없음. 표가 커지면 지난 것만 지움 (주소 수 상한 대신)
-func (d *daemon) fullDeltaWait(remote string) time.Duration {
+// clientWait : 이 주소가 kind (/json-delta 전체, 공개 쪽 /json 등) 를 받아도 되면 0 (그리고 지금 시각을 기록), 아니면 남은 시간
+// 간격 = -delta-full-interval, 0 = 제한 없음. 주소 = clientKey (IPv6 는 /64). 표가 커지면 지난 것만 지움 (주소 수 상한 대신)
+func (d *daemon) clientWait(kind, remote string) time.Duration {
 	iv := d.c().DeltaFullInterval
 	if iv <= 0 {
 		return 0
 	}
-	host := remote
-	if ap, err := netip.ParseAddrPort(remote); err == nil {
-		host = ap.Addr().Unmap().String()
-	}
+	host := kind + " " + clientKey(remote)
 	now := time.Now()
 	d.fullMu.Lock()
 	defer d.fullMu.Unlock()
@@ -528,10 +523,15 @@ func queryInt(r *http.Request, name string, def, lo, hi int) (int, error) {
 	return n, nil
 }
 
-// parseObjFilter : type ta status uri as prefix
+// parseObjFilter : type kind ta status uri as prefix
 func parseObjFilter(r *http.Request) (*objFilter, error) {
 	q := r.URL.Query()
-	f := &objFilter{Type: q.Get("type"), TA: q.Get("ta"), Status: q.Get("status"), URIPrefix: q.Get("uri")}
+	f := &objFilter{Type: q.Get("type"), Kind: q.Get("kind"), TA: q.Get("ta"), Status: q.Get("status"), URIPrefix: q.Get("uri")}
+	switch f.Kind {
+	case "", "TA", "CA", "router":
+	default:
+		return nil, fmt.Errorf("kind = TA / CA / router")
+	}
 	if s := q.Get("as"); s != "" {
 		a, err := parseASN(s)
 		if err != nil {
@@ -549,7 +549,7 @@ func parseObjFilter(r *http.Request) (*objFilter, error) {
 	return f, nil
 }
 
-// GET /api/v1/objects?type=&ta=&as=&prefix=&uri=&status=&limit=&offset=
+// GET /api/v1/objects?type=&kind=&ta=&as=&prefix=&uri=&status=&limit=&offset=
 func (d *daemon) handleObjects(w http.ResponseWriter, r *http.Request) {
 	_, view := d.current()
 	if view == nil {

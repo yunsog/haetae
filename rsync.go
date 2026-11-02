@@ -15,6 +15,13 @@ import (
 	"syscall"
 )
 
+// rsync 로 받은 모듈 하나의 상한 (RRDP snapshot 상한과 같은 수준). 넘으면 그 모듈을 지우고 실패
+// 받는 도중의 크기는 시간 제한 (저장소당 5 분) 이 막음
+const (
+	maxRsyncFiles = maxRRDPFiles
+	maxRsyncBytes = 4 << 30
+)
+
 // rsyncDir : caRepository URI 의 캐시 폴더
 func rsyncDir(cacheDir, repo string) string {
 	return filepath.Join(cacheDir, "rsync", filepath.FromSlash(strings.TrimSuffix(strings.TrimPrefix(repo, "rsync://"), "/")))
@@ -50,6 +57,28 @@ func (f *fetcher) runRsync(ctx context.Context, repo string) error {
 		}
 		return fmt.Errorf("rsync %s: %v: %s", src, err, msg)
 	}
+	if err := checkTreeLimit(dst, maxRsyncFiles, maxRsyncBytes); err != nil {
+		os.RemoveAll(dst) // 너무 큰 저장소 = 믿지 않음 (다음에 다시 받음)
+		return fmt.Errorf("rsync %s: %w", src, err)
+	}
 	f.addRsync()
 	return nil
+}
+
+// checkTreeLimit : 폴더 아래 파일 수 / 전체 크기가 상한 안인지
+func checkTreeLimit(dir string, maxFiles int, maxBytes int64) error {
+	files, bytes := 0, int64(0)
+	return filepath.WalkDir(dir, func(p string, e os.DirEntry, err error) error {
+		if err != nil || e.IsDir() {
+			return err
+		}
+		files++
+		if fi, err := e.Info(); err == nil {
+			bytes += fi.Size()
+		}
+		if files > maxFiles || bytes > maxBytes {
+			return fmt.Errorf("too large (> %d files or > %d bytes)", maxFiles, maxBytes)
+		}
+		return nil
+	})
 }

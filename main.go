@@ -28,6 +28,9 @@ import (
 	"time"
 )
 
+// version : 해태 판 (상태 API, RRDP User-Agent, 공개 저장소 태그 v<판>). 판을 올릴 때 여기 한 곳만 고침
+const version = "0.2.0"
+
 // 상주 모드 폴더 기본값 (10-31, 운영 = 전용 계정 haetae). 개발 때는 -cache data/cache -o data/out -state data/state 처럼 직접 줌.
 // -validate 는 기본값을 쓰지 않음 (-cache / -o 필수) : 시험 검증이 운영 캐시를 건드리지 않게
 const (
@@ -38,17 +41,19 @@ const (
 
 // options : 명령줄 옵션 (설정 파일 config.go 도 같은 이름으로 채움)
 type options struct {
-	parse, rscFile, failOut, cacheDir, talDir, outDir                      *string
-	workers, fetchJobs                                                     *int
-	validate, fetch, noRsync, once                                         *bool
-	evalTime                                                               *int64
-	stateDir, slurmPath, rtrAddr, rtrAllow, rtrAuth                        *string
-	rtrTLS, rtrTLSCert, rtrTLSKey, rtrTLSCA, rtrStdio, httpAddr, httpAllow *string
-	rtrRefresh, rtrRetry, rtrExpire                                        *uint
-	interval, deltaFull, maxStartAge                                       *time.Duration
-	jsonExt, holdDrop                                                      *bool
-	dropWarn                                                               *float64
-	config                                                                 *string
+	parse, rscFile, failOut, cacheDir, talDir, outDir                                  *string
+	workers, fetchJobs, rtrMaxConns, rtrMaxPerIP                                       *int
+	validate, fetch, noRsync, once                                                     *bool
+	evalTime                                                                           *int64
+	stateDir, slurmPath, rtrAddr, rtrAllow, rtrAuth                                    *string
+	rtrTLS, rtrTLSCert, rtrTLSKey, rtrTLSCA, rtrStdio, httpAddr, httpAllow, httpPublic *string
+	rtrRefresh, rtrRetry, rtrExpire                                                    *uint
+	interval, deltaFull, maxStartAge, staleWarn, staleClose                            *time.Duration
+	jsonExt, holdDrop                                                                  *bool
+	dropWarn                                                                           *float64
+	config                                                                             *string
+	resume                                                                             *string
+	handoverCheck                                                                      *bool
 }
 
 // defineFlags : 옵션 정의 (main 과 시험이 같이 씀)
@@ -76,6 +81,8 @@ func defineFlags(f *flag.FlagSet) *options {
 	o.rtrAddr = f.String("rtr", ":3323", "RTR 주소 (빈 값 = 안 엶)")
 	o.rtrAllow = f.String("rtr-allow", "127.0.0.1,::1", "RTR 허용 주소 / 대역 (쉼표)")
 	o.rtrAuth = f.String("rtr-auth", "", "RTR TCP-MD5 / TCP-AO 키 파일 (줄마다 <주소> md5 <키> | <주소> ao <알고리즘> <sendid> <recvid> <키>)")
+	o.rtrMaxConns = f.Int("rtr-max-conns", 256, "RTR 동시 연결 상한 (0 = 없음)")
+	o.rtrMaxPerIP = f.Int("rtr-max-per-ip", 4, "주소 하나 (IPv6 는 /64) 의 RTR 동시 연결 상한 (0 = 없음)")
 	o.rtrRefresh = f.Uint("rtr-refresh", 600, "RTR refresh (초, 1~86400) : 라우터가 Notify 없이도 묻는 간격 (v1 / v2)")
 	o.rtrRetry = f.Uint("rtr-retry", 300, "RTR retry (초, 1~7200) : 끊겼을 때 라우터가 다시 붙는 간격")
 	o.rtrExpire = f.Uint("rtr-expire", 7200, "RTR expire (초, 600~172800, refresh / retry 보다 커야 함) : 이 시간 못 받으면 라우터가 VRP 를 버림")
@@ -86,11 +93,17 @@ func defineFlags(f *flag.FlagSet) *options {
 	o.rtrStdio = f.String("rtr-stdio", "", "표준 입출력을 이 RTR 주소로 이음 (sshd rpki-rtr subsystem 용, 예 127.0.0.1:3323)")
 	o.httpAddr = f.String("http", "127.0.0.1:8323", "HTTP API 주소, 여러 개는 쉼표 (빈 값 = 안 엶, 예 127.0.0.1:8323,0.0.0.0:5002)")
 	o.httpAllow = f.String("http-allow", "127.0.0.1,::1", "HTTP API 허용 주소 / 대역 (쉼표, 모든 -http 주소에 적용, 밖이면 403)")
+	o.httpPublic = f.String("http-public", "", "HTTP API 공개 쪽 주소 / 대역 (조회 경로만, 상태는 내부 정보 뺀 판, -http-allow 가 우선). 빈 값 = 없음")
 	o.jsonExt = f.Bool("jsonext", false, "HTTP /jsonext 엶 (Routinator 모양, 약 470 MB, 부를 때마다 약 5 초 계산. 차이 조사 때만)")
 	o.deltaFull = f.Duration("delta-full-interval", time.Minute, "/json-delta 전체 (reset) 를 받는 쪽 주소마다 이 간격에 한 번, 그 안이면 429 (0 = 제한 없음)")
 	o.maxStartAge = f.Duration("max-start-age", 2*time.Hour, "시작 때 직전 VRP 를 쓸 최대 나이")
+	o.staleWarn = f.Duration("stale-warn", time.Hour, "집합 (검증 시각) 이 이보다 오래되면 경고 로그 / 상태 stale / healthz 503 (0 = 안 봄)")
+	o.staleClose = f.Duration("stale-close", 0, "집합이 이보다 오래되면 RTR 을 닫음 = 라우터가 다른 RP 로 (0 = 끔, 쓰면 30m 이상)")
 	o.dropWarn = f.Float64("drop-warn", 0.1, "VRP 가 이 비율 넘게 줄면 경고")
 	o.holdDrop = f.Bool("hold-drop", false, "VRP 급감이면 반영 보류 (D1 보류 옵션)")
+	// 판 올리기 (handover.go) : 사람이 쓰는 옵션 아님. 옛 프로세스가 새 실행 파일을 부를 때
+	o.resume = f.String("resume", "", "(판 올리기 안에서만) 옛 프로세스가 넘긴 상태 파일로 이어 시작")
+	o.handoverCheck = f.Bool("handover-check", false, "(판 올리기 안에서만) 설정 / TAL 을 확인하고 상태 형식 판을 찍음")
 	return o
 }
 
@@ -135,7 +148,10 @@ func main() {
 		}
 		cfg.ConfPath = path
 		cfg.Reload = func() (daemonConfig, string, error) { return reloadConfig(path) }
-		os.Exit(runDaemon(cfg, *o.once))
+		if *o.handoverCheck {
+			os.Exit(handoverCheck(cfg))
+		}
+		os.Exit(runDaemon(cfg, *o.once, *o.resume))
 	}
 }
 
@@ -150,14 +166,24 @@ func buildDaemonConfig(o *options) (daemonConfig, error) {
 	if err := checkRTRTimers(*o.rtrRefresh, *o.rtrRetry, *o.rtrExpire); err != nil {
 		return daemonConfig{}, err
 	}
+	if err := checkLimits(*o.workers, *o.fetchJobs, *o.interval, *o.dropWarn, *o.deltaFull, *o.maxStartAge); err != nil {
+		return daemonConfig{}, err
+	}
+	if *o.rtrMaxConns < 0 || *o.rtrMaxPerIP < 0 || *o.rtrMaxConns > 100000 || *o.rtrMaxPerIP > 1000 {
+		return daemonConfig{}, fmt.Errorf("rtr-max-conns %d (0~100000) / rtr-max-per-ip %d (0~1000)", *o.rtrMaxConns, *o.rtrMaxPerIP)
+	}
+	if *o.staleWarn < 0 || *o.staleClose < 0 || (*o.staleClose > 0 && *o.staleClose < 30*time.Minute) {
+		return daemonConfig{}, fmt.Errorf("stale-warn %s / stale-close %s : 0 이상, stale-close 는 0 (끔) 또는 30m 이상", *o.staleWarn, *o.staleClose)
+	}
 	return daemonConfig{
 		CacheDir: *o.cacheDir, TALDir: *o.talDir, OutDir: *o.outDir, StateDir: *o.stateDir, SLURM: *o.slurmPath,
 		Interval: *o.interval, Workers: *o.workers, FetchJobs: *o.fetchJobs, NoRsync: *o.noRsync,
 		RTRAddr: *o.rtrAddr, RTRAllow: splitList(*o.rtrAllow), RTRAuth: *o.rtrAuth,
 		RTRRefresh: uint32(*o.rtrRefresh), RTRRetry: uint32(*o.rtrRetry), RTRExpire: uint32(*o.rtrExpire),
+		RTRMaxConns: *o.rtrMaxConns, RTRMaxPerIP: *o.rtrMaxPerIP,
 		RTRTLSAddr: *o.rtrTLS, RTRTLSCert: *o.rtrTLSCert, RTRTLSKey: *o.rtrTLSKey, RTRTLSCA: *o.rtrTLSCA,
-		HTTPAddr: *o.httpAddr, HTTPAllow: splitList(*o.httpAllow), JSONExt: *o.jsonExt, DeltaFullInterval: *o.deltaFull,
-		MaxStartAge: *o.maxStartAge, DropWarn: *o.dropWarn, HoldOnDrop: *o.holdDrop,
+		HTTPAddr: *o.httpAddr, HTTPAllow: splitList(*o.httpAllow), HTTPPublic: splitList(*o.httpPublic), JSONExt: *o.jsonExt, DeltaFullInterval: *o.deltaFull,
+		MaxStartAge: *o.maxStartAge, DropWarn: *o.dropWarn, HoldOnDrop: *o.holdDrop, StaleWarn: *o.staleWarn, StaleClose: *o.staleClose,
 	}, nil
 }
 
@@ -180,6 +206,25 @@ func reloadConfig(startPath string) (daemonConfig, string, error) {
 	}
 	cfg, err := buildDaemonConfig(o)
 	return cfg, path, err
+}
+
+// checkLimits : 상주 설정 값의 범위 (0 이면 회차가 끝나지 않고, 음수는 panic -> 시작 / reload 때 거부)
+func checkLimits(workers, jobs int, interval time.Duration, dropWarn float64, deltaFull, maxStartAge time.Duration) error {
+	switch {
+	case workers < 1 || workers > 1024:
+		return fmt.Errorf("j (validation.workers) %d : 1~1024", workers)
+	case jobs < 1 || jobs > 1024:
+		return fmt.Errorf("fetch-j (fetch.jobs) %d : 1~1024", jobs)
+	case interval < time.Minute:
+		return fmt.Errorf("interval %s : 1m 이상", interval)
+	case dropWarn < 0 || dropWarn > 1:
+		return fmt.Errorf("drop-warn %g : 0~1", dropWarn)
+	case deltaFull < 0:
+		return fmt.Errorf("delta-full-interval %s : 0 이상", deltaFull)
+	case maxStartAge < 0:
+		return fmt.Errorf("max-start-age %s : 0 이상", maxStartAge)
+	}
+	return nil
 }
 
 // checkRTRTimers : RFC 8210 6 장의 범위 (expire 는 refresh / retry 보다 커야 함)

@@ -104,25 +104,35 @@ func (t *tal) loadTA(cacheDir string) (*rpkiCert, error) {
 			lastErr = err
 			continue
 		}
-		c, err := parseCert(der, false)
+		c, err := t.checkTA(der)
 		if err != nil {
 			return nil, fmt.Errorf("TA %s: %w", p, err)
-		}
-		if c.Kind != kindCA || !c.SelfSigned {
-			return nil, fmt.Errorf("TA %s: not a self-signed CA", p)
-		}
-		if !bytes.Equal(c.X509.RawSubjectPublicKeyInfo, t.SPKI) {
-			return nil, fmt.Errorf("TA %s: key differs from TAL", p)
-		}
-		if err := c.X509.CheckSignatureFrom(c.X509); err != nil {
-			return nil, fmt.Errorf("TA %s: self signature: %w", p, err)
-		}
-		if c.IPs.V4.Inherit || c.IPs.V6.Inherit || c.ASs.Inherit {
-			return nil, fmt.Errorf("TA %s: inherit not allowed", p)
 		}
 		return c, nil
 	}
 	return nil, fmt.Errorf("TA certificate not in cache: %v", lastErr)
+}
+
+// checkTA : TA 인증서가 이 TAL 의 것인지 (자체 서명 CA, TAL 공개키와 같음, 서명 맞음, inherit 없음)
+// 캐시에서 읽을 때 (loadTA) 와 받은 직후 캐시에 넣기 전 (fetchTA) 에 씀
+func (t *tal) checkTA(der []byte) (*rpkiCert, error) {
+	c, err := parseCert(der, false)
+	if err != nil {
+		return nil, err
+	}
+	if c.Kind != kindCA || !c.SelfSigned {
+		return nil, fmt.Errorf("not a self-signed CA")
+	}
+	if !bytes.Equal(c.X509.RawSubjectPublicKeyInfo, t.SPKI) {
+		return nil, fmt.Errorf("key differs from TAL")
+	}
+	if err := c.X509.CheckSignatureFrom(c.X509); err != nil {
+		return nil, fmt.Errorf("self signature: %w", err)
+	}
+	if c.IPs.V4.Inherit || c.IPs.V6.Inherit || c.ASs.Inherit {
+		return nil, fmt.Errorf("inherit not allowed")
+	}
+	return c, nil
 }
 
 // loadTALs : dir 이 비었으면 내장 TAL, 아니면 그 폴더의 *.tal. 하나라도 깨지면 오류 (반쪽 TA 로 돌지 않음)

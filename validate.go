@@ -19,6 +19,7 @@ import (
 	"fmt"
 	"net/netip"
 	"os"
+	"path"
 	"path/filepath"
 	"runtime/debug"
 	"slices"
@@ -111,36 +112,39 @@ type validator struct {
 	Workers  int
 	Fetch    *fetcher // nil = 오프라인 (CacheDir 를 그대로 읽음, rpki-client 캐시 모양)
 	KeepCAs  bool     // 검증된 CA 를 SKI 로 모음 (RSC 체인 확인, rsc.go). 메모리 때문에 평소에는 끔
+	ValidDir string   // 직전 정상 publication point 저장 폴더 (valid.go). "" = 끔 (-validate 오프라인 비교)
 
 	sem chan struct{}
 	wg  sync.WaitGroup
 
-	mu       sync.Mutex
-	vrps     map[vrpKey]time.Time
-	vrpSrc   map[vrpKey][]vrpSource
-	unsafe   []unsafeRange
-	aspas    map[aspaKey]*aspaOut
-	rkeys    []routerKeyOut
-	objects  []objInfo
-	seenCA   map[string]bool     // manifest URI -> 이미 처리 (같은 CA 두 번 방지)
-	count    map[string]int      // 통계 (종류별 valid / rejected, 경고)
-	warnEx   map[string][]string // 경고마다 예시 몇 개 (원인 확인용)
-	failedTA []string
-	caBySKI  map[string][]*caRecord // KeepCAs 일 때만
+	mu        sync.Mutex
+	vrps      map[vrpKey]time.Time
+	vrpSrc    map[vrpKey][]vrpSource
+	unsafe    []unsafeRange
+	aspas     map[aspaKey]*aspaOut
+	rkeys     []routerKeyOut
+	objects   []objInfo
+	seenCA    map[string]bool     // manifest URI -> 이미 처리 (같은 CA 두 번 방지)
+	validSeen map[string]bool     // 이번 회차에 본 직전 정상본 폴더 (나머지는 cleanValid 가 지움)
+	count     map[string]int      // 통계 (종류별 valid / rejected, 경고)
+	warnEx    map[string][]string // 경고마다 예시 몇 개 (원인 확인용)
+	failedTA  []string
+	caBySKI   map[string][]*caRecord // KeepCAs 일 때만
 }
 
 func newValidator(cacheDir string, now time.Time, workers int) *validator {
 	return &validator{
-		CacheDir: cacheDir,
-		Now:      now,
-		Workers:  workers,
-		sem:      make(chan struct{}, workers),
-		vrps:     map[vrpKey]time.Time{},
-		vrpSrc:   map[vrpKey][]vrpSource{},
-		aspas:    map[aspaKey]*aspaOut{},
-		seenCA:   map[string]bool{},
-		count:    map[string]int{},
-		warnEx:   map[string][]string{},
+		CacheDir:  cacheDir,
+		Now:       now,
+		Workers:   workers,
+		sem:       make(chan struct{}, workers),
+		vrps:      map[vrpKey]time.Time{},
+		vrpSrc:    map[vrpKey][]vrpSource{},
+		aspas:     map[aspaKey]*aspaOut{},
+		seenCA:    map[string]bool{},
+		validSeen: map[string]bool{},
+		count:     map[string]int{},
+		warnEx:    map[string][]string{},
 	}
 }
 
@@ -158,12 +162,13 @@ func (v *validator) run(tals []*tal) {
 		}
 		uri := t.rsyncURI()
 		if err != nil {
-			v.reject("cer", uri, t.Name, "", err)
+			v.rejectCert(uri, t.Name, "", err, nil, "TA")
 			v.mu.Lock()
 			v.failedTA = append(v.failedTA, t.Name)
 			v.mu.Unlock()
 			continue
 		}
+		v.warnSKI(ta, uri)
 		v.valid("cer", uri, t.Name, "", ta.X509.Raw, ta.X509.NotBefore, ta.X509.NotAfter,
 			map[string]any{"kind": "TA", "repository": ta.CARepository, "notify": ta.Notify, "resources": newResSummary(ta.IPs, ta.ASs)})
 		v.spawn(caCtx{Cert: ta, URI: uri, TA: t.Name, IPs: ta.IPs, ASs: ta.ASs,
@@ -212,10 +217,34 @@ func (v *validator) warn(what, detail string) {
 	v.mu.Unlock()
 }
 
+// warnSKI : 확인을 통과한 인증서의 SKI 가 키 해시가 아니면 경고 (거부는 보류, 11-02 사용자 : 적용하고 지켜봄)
+func (v *validator) warnSKI(c *rpkiCert, uri string) {
+	if c.SKIBad {
+		v.warn("SKI is not SHA-1 of public key", uri)
+	}
+}
+
 func (v *validator) reject(typ, uri, ta, parent string, err error) {
+	v.rejectSum(typ, uri, ta, parent, err, nil)
+}
+
+// rejectCert : 거부된 인증서. 종류 (TA / CA / router) 를 알면 summary.kind 로 남김 (objects 의 kind 조건)
+// 파싱부터 실패하면 c = nil -> 종류 모름 (summary 없음)
+func (v *validator) rejectCert(uri, ta, parent string, err error, c *rpkiCert, kind string) {
+	var sum any
+	if kind == "" && c != nil {
+		kind = c.Kind.String()
+	}
+	if kind != "" {
+		sum = map[string]any{"kind": kind}
+	}
+	v.rejectSum("cer", uri, ta, parent, err, sum)
+}
+
+func (v *validator) rejectSum(typ, uri, ta, parent string, err error, sum any) {
 	v.mu.Lock()
 	v.count[typ+" rejected"]++
-	v.objects = append(v.objects, objInfo{Type: typ, URI: uri, TA: ta, Parent: parent, Status: "rejected", Reason: err.Error()})
+	v.objects = append(v.objects, objInfo{Type: typ, URI: uri, TA: ta, Parent: parent, Status: "rejected", Reason: err.Error(), Summary: sum})
 	v.mu.Unlock()
 }
 
@@ -379,12 +408,13 @@ func (v *validator) processCA(ctx caCtx) {
 		return
 	}
 
-	mft, crl, crlURI, files, err := v.loadPublicationPoint(&ctx)
+	pp, fallback, err := v.publicationPoint(&ctx)
 	if err != nil {
 		v.reject("mft", c.Manifest, ctx.TA, ctx.URI, fmt.Errorf("no valid manifest available: %w", err))
 		v.addUnsafe(ctx.URI, ctx.IPs)
 		return
 	}
+	mft, crl, crlURI, files := pp.mft, pp.crl, pp.crlURI, pp.files
 	if v.KeepCAs {
 		v.mu.Lock()
 		if v.caBySKI == nil {
@@ -393,8 +423,11 @@ func (v *validator) processCA(ctx caCtx) {
 		v.caBySKI[string(c.SKI)] = append(v.caBySKI[string(c.SKI)], &caRecord{ctx, crl, crlURI})
 		v.mu.Unlock()
 	}
-	v.valid("mft", c.Manifest, ctx.TA, ctx.URI, nil, mft.ThisUpdate, mft.NextUpdate,
-		map[string]any{"number": mft.Number.String(), "files": len(mft.Files)})
+	mftSum := map[string]any{"number": mft.Number.String(), "files": len(mft.Files)}
+	if fallback {
+		mftSum["fallback"] = true // 새것이 틀려 직전 정상본으로 검증
+	}
+	v.valid("mft", c.Manifest, ctx.TA, ctx.URI, nil, mft.ThisUpdate, mft.NextUpdate, mftSum)
 	v.valid("crl", crlURI, ctx.TA, ctx.URI, crl.X509.Raw, crl.ThisUpdate, crl.NextUpdate,
 		map[string]any{"revoked": len(crl.Revoked)})
 
@@ -420,40 +453,89 @@ func (v *validator) processCA(ctx caCtx) {
 	}
 }
 
-// loadPublicationPoint : manifest + CRL + 나열된 파일 전부 (하나라도 틀리면 오류 = CA 전체 버림)
-func (v *validator) loadPublicationPoint(ctx *caCtx) (*rpkiManifest, *rpkiCRL, string, []mftEntry, error) {
+// publicationPoint : 받은 캐시의 publication point. 틀리면 직전 정상본 (ValidDir, valid.go) 으로 다시. fallback = 직전 정상본을 씀
+func (v *validator) publicationPoint(ctx *caCtx) (*pubPoint, bool, error) {
 	c := ctx.Cert
-	mp, err := uriPath(ctx.Base, c.Manifest)
-	if err != nil {
-		return nil, nil, "", nil, err
+	pp, err := v.loadPublicationPoint(ctx, func(uri string) (string, error) { return uriPath(ctx.Base, uri) })
+	if v.ValidDir == "" {
+		return pp, false, err
 	}
+	dir, derr := validPPDir(v.ValidDir, c.Manifest)
+	if derr != nil {
+		return pp, false, err
+	}
+	v.mu.Lock()
+	v.validSeen[dir] = true
+	v.mu.Unlock()
+	prev := storedNumber(dir)
+	if err == nil && prev != nil && pp.mft.Number.Cmp(prev) < 0 {
+		err = fmt.Errorf("manifest number %s lower than previous %s", pp.mft.Number, prev)
+	}
+	if err == nil {
+		if serr := storeValid(dir, path.Base(c.Manifest), pp); serr != nil {
+			v.warn("cannot store valid publication point", c.Manifest+": "+serr.Error())
+		}
+		return pp, false, nil
+	}
+	if prev == nil {
+		return nil, false, err // 직전 정상본 없음
+	}
+	old, oerr := v.loadPublicationPoint(ctx, validAt(dir))
+	if oerr != nil {
+		return nil, false, fmt.Errorf("%w (previous valid copy: %v)", err, oerr)
+	}
+	v.warn("manifest failed, using previous valid publication point", c.Manifest+": "+err.Error())
+	return old, true, nil
+}
+
+// pubPoint : 확인을 마친 publication point (manifest + CRL + 나열된 파일)
+type pubPoint struct {
+	mft    *rpkiManifest
+	mftDER []byte
+	crl    *rpkiCRL
+	crlURI string
+	files  []mftEntry
+	paths  map[string]string // 파일 이름 -> 읽은 곳 (직전 정상본 저장 때 hard link 원본)
+}
+
+// loadPublicationPoint : manifest + CRL + 나열된 파일 전부 (하나라도 틀리면 오류 = CA 전체 버림)
+// at : 객체 URI -> 읽을 파일 (받은 캐시 = uriPath(ctx.Base, uri), 직전 정상본 = 그 폴더의 파일 이름)
+func (v *validator) loadPublicationPoint(ctx *caCtx, at func(uri string) (string, error)) (*pubPoint, error) {
+	c := ctx.Cert
+	paths := map[string]string{}
+	mp, err := at(c.Manifest)
+	if err != nil {
+		return nil, err
+	}
+	paths[path.Base(c.Manifest)] = mp
 	der, err := readObject(mp)
 	if err != nil {
-		return nil, nil, "", nil, err
+		return nil, err
 	}
 	mft, err := parseManifest(der)
 	if err != nil {
-		return nil, nil, "", nil, err
+		return nil, err
 	}
 	ee := mft.EE
 	if !bytes.Equal(ee.AKI, c.SKI) {
-		return nil, nil, "", nil, fmt.Errorf("manifest EE AKI does not match CA SKI")
+		return nil, fmt.Errorf("manifest EE AKI does not match CA SKI")
 	}
 	if err := ee.X509.CheckSignatureFrom(c.X509); err != nil {
-		return nil, nil, "", nil, fmt.Errorf("manifest EE signature: %w", err)
+		return nil, fmt.Errorf("manifest EE signature: %w", err)
 	}
 	if err := v.checkValidity(ee.X509.NotBefore, ee.X509.NotAfter); err != nil {
-		return nil, nil, "", nil, fmt.Errorf("manifest EE: %w", err)
+		return nil, fmt.Errorf("manifest EE: %w", err)
 	}
 	if v.Now.Before(mft.ThisUpdate) {
-		return nil, nil, "", nil, fmt.Errorf("manifest thisUpdate in the future")
+		return nil, fmt.Errorf("manifest thisUpdate in the future")
 	}
 	if v.Now.After(mft.NextUpdate) {
-		return nil, nil, "", nil, fmt.Errorf("manifest is stale (nextUpdate %s)", mft.NextUpdate.Format(time.RFC3339))
+		return nil, fmt.Errorf("manifest is stale (nextUpdate %s)", mft.NextUpdate.Format(time.RFC3339))
 	}
 	if ee.SignedObject != c.Manifest {
 		v.warn("manifest EE signedObject does not match location", c.Manifest)
 	}
+	v.warnSKI(ee, c.Manifest)
 
 	// 나열된 파일 : 같은 폴더 (manifest 위치 기준), 해시 확인
 	base := c.Manifest[:strings.LastIndexByte(c.Manifest, '/')+1]
@@ -461,49 +543,50 @@ func (v *validator) loadPublicationPoint(ctx *caCtx) (*rpkiManifest, *rpkiCRL, s
 	var crlEntry *mftEntry
 	for _, mf := range mft.Files {
 		uri := base + mf.Name
-		p, err := uriPath(ctx.Base, uri)
+		p, err := at(uri)
 		if err != nil {
-			return nil, nil, "", nil, err
+			return nil, err
 		}
+		paths[mf.Name] = p
 		data, err := readObject(p)
 		if err != nil {
-			return nil, nil, "", nil, fmt.Errorf("listed file %s: %w", mf.Name, err)
+			return nil, fmt.Errorf("listed file %s: %w", mf.Name, err)
 		}
 		if sha256.Sum256(data) != mf.Hash {
-			return nil, nil, "", nil, fmt.Errorf("listed file %s: hash mismatch", mf.Name)
+			return nil, fmt.Errorf("listed file %s: hash mismatch", mf.Name)
 		}
 		files = append(files, mftEntry{mf.Name, uri, data})
 		if strings.HasSuffix(mf.Name, ".crl") {
 			if crlEntry != nil {
-				return nil, nil, "", nil, fmt.Errorf("more than one CRL")
+				return nil, fmt.Errorf("more than one CRL")
 			}
 			crlEntry = &files[len(files)-1]
 		}
 	}
 	if crlEntry == nil {
-		return nil, nil, "", nil, fmt.Errorf("no CRL in manifest")
+		return nil, fmt.Errorf("no CRL in manifest")
 	}
 	crlURI := crlEntry.URI
 	crl, err := parseCRL(crlEntry.Data)
 	if err != nil {
-		return nil, nil, "", nil, fmt.Errorf("CRL: %w", err)
+		return nil, fmt.Errorf("CRL: %w", err)
 	}
 	if !bytes.Equal(crl.AKI, c.SKI) {
-		return nil, nil, "", nil, fmt.Errorf("CRL AKI does not match CA SKI")
+		return nil, fmt.Errorf("CRL AKI does not match CA SKI")
 	}
 	if err := crl.X509.CheckSignatureFrom(c.X509); err != nil {
-		return nil, nil, "", nil, fmt.Errorf("CRL signature: %w", err)
+		return nil, fmt.Errorf("CRL signature: %w", err)
 	}
 	if v.Now.Before(crl.ThisUpdate) {
-		return nil, nil, "", nil, fmt.Errorf("CRL thisUpdate in the future")
+		return nil, fmt.Errorf("CRL thisUpdate in the future")
 	}
 	if v.Now.After(crl.NextUpdate) {
-		return nil, nil, "", nil, fmt.Errorf("CRL has expired")
+		return nil, fmt.Errorf("CRL has expired")
 	}
 	if crl.Revoked[ee.X509.SerialNumber.String()] {
-		return nil, nil, "", nil, fmt.Errorf("manifest EE is revoked")
+		return nil, fmt.Errorf("manifest EE is revoked")
 	}
-	return mft, crl, crlURI, files, nil
+	return &pubPoint{mft: mft, mftDER: der, crl: crl, crlURI: crlURI, files: files, paths: paths}, nil
 }
 
 // readObject : 크기 상한을 지키며 파일 읽기
@@ -531,18 +614,19 @@ func (v *validator) processCert(ctx *caCtx, crl *rpkiCRL, crlURI string, f mftEn
 		ips, as, err = resolveResources(c, ctx)
 	}
 	if err != nil {
-		v.reject("cer", f.URI, ctx.TA, ctx.URI, err)
+		v.rejectCert(f.URI, ctx.TA, ctx.URI, err, c, "")
 		if c != nil && c.Kind == kindCA {
 			v.addUnsafe(f.URI, ownIPs(c, ctx))
 		}
 		return
 	}
+	v.warnSKI(c, f.URI)
 	exp := minTime(ch.Exp, c.X509.NotAfter)
 
 	switch c.Kind {
 	case kindCA:
 		if c.SelfSigned {
-			v.reject("cer", f.URI, ctx.TA, ctx.URI, fmt.Errorf("self-signed certificate below TA"))
+			v.rejectCert(f.URI, ctx.TA, ctx.URI, fmt.Errorf("self-signed certificate below TA"), c, "")
 			return
 		}
 		v.valid("cer", f.URI, ctx.TA, ctx.URI, f.Data, c.X509.NotBefore, c.X509.NotAfter,
@@ -552,7 +636,7 @@ func (v *validator) processCert(ctx *caCtx, crl *rpkiCRL, crlURI string, f mftEn
 	case kindRouter:
 		keys, err := c.routerKeys()
 		if err != nil {
-			v.reject("cer", f.URI, ctx.TA, ctx.URI, err)
+			v.rejectCert(f.URI, ctx.TA, ctx.URI, err, c, "")
 			return
 		}
 		var asns []uint32
@@ -631,6 +715,7 @@ func (v *validator) processSigned(ctx *caCtx, crl *rpkiCRL, crlURI string, f mft
 	if so.EE.SignedObject != f.URI {
 		v.warn("EE signedObject does not match location", f.URI)
 	}
+	v.warnSKI(so.EE, f.URI)
 	ee := so.EE.X509
 	exp := minTime(ch.Exp, ee.NotAfter)
 

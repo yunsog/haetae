@@ -17,8 +17,10 @@ import (
 	"time"
 )
 
-// 객체 파일 크기 상한 (rpki-client MAX_FILE_SIZE 와 같은 4 MB)
-const maxObjectSize = 4000000
+// 객체 파일 하나의 크기 상한 (바이너리 = DER). RFC 에 없는 값, RP 마다 정함 (rpki-client 4 MB, Routinator 기본 20 MB).
+// 0.2.0 : 4 MB -> 20 MB (11-02 사용자 결정, Routinator 기본값과 같음). 실제 가장 큰 객체 = ARIN CA manifest 3.87 MB (2026-11) 로 4 MB 의 97 %,
+// 넘는 날 그 CA 전체가 빠짐. 이 값에서 rsync --max-size, TA 받기, RRDP base64 글자 상한 (maxTextRun) 이 따라 정해짐
+const maxObjectSize = 20000000
 
 // tag 클래스
 const (

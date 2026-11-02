@@ -106,7 +106,8 @@ func TestRTRTimers(t *testing.T) {
 // HTTP 허용 목록 : 밖이면 403, IPv4-mapped 도 같은 주소
 func TestHTTPAllow(t *testing.T) {
 	allow := []netip.Prefix{netip.MustParsePrefix("127.0.0.1/32"), netip.MustParsePrefix("198.51.100.0/24")}
-	h := httpAllowOnly(func() *[]netip.Prefix { return &allow }, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+	ok := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {})
+	h := httpAccess(func() *[]netip.Prefix { return &allow }, nil, ok, ok)
 	for addr, want := range map[string]int{
 		"127.0.0.1:5000":          200,
 		"198.51.100.20:5000":      200,

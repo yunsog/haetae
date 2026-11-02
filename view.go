@@ -234,6 +234,7 @@ func objOverlaps(o *objInfo, p netip.Prefix) bool {
 // objFilter : /api/v1/objects, /api/v1/expiring 조건
 type objFilter struct {
 	Type, TA, Status, URIPrefix string
+	Kind                        string // 인증서 종류 summary.kind (TA / CA / router), 11-02
 	ASN                         *uint32
 	Prefix                      *netip.Prefix
 	ExpireBefore                time.Time // 0 이 아니면 notAfter 가 이 앞인 것만
@@ -245,6 +246,12 @@ func (f *objFilter) match(o *objInfo) bool {
 	}
 	if f.TA != "" && o.TA != f.TA {
 		return false
+	}
+	if f.Kind != "" {
+		m, _ := o.Summary.(map[string]any)
+		if k, _ := m["kind"].(string); k != f.Kind {
+			return false
+		}
 	}
 	if f.Status != "" && o.Status != f.Status {
 		return false

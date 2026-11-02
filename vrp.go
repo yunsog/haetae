@@ -8,6 +8,7 @@ package main
 // RTR 에는 TA 구분이 없으므로 (prefix, maxLength, ASN) 이 같으면 하나로 침.
 
 import (
+	"bufio"
 	"bytes"
 	"encoding/base64"
 	"encoding/gob"
@@ -410,6 +411,105 @@ func (s *store) aspaAt(c, to uint32) []uint32 {
 
 // ---- 재시작 대비 저장 (C4, B5) ----
 
+// savedState : 재시작 복원용 한 파일 (state/payload.gob, 0.2.0). RTR 에 준 집합 (SLURM 뒤) + session / serial + delta 기록을
+// 같은 순간에 한 번에 씀 -> 셋이 언제나 같은 회차 (전에는 state.json / out/json / deltas.gob 을 따로 써서 어긋날 수 있었음)
+type savedState struct {
+	Session  uint16
+	Serial   uint32
+	Saved    time.Time
+	Built    time.Time
+	VRPs     []rtrVRP
+	Keys     []rtrKey
+	ASPAs    map[uint32][]uint32
+	Full     []vrpKey
+	FullExp  []int64 // Full 과 같은 순서, Unix 초
+	TAs      []string
+	FailedTA []string
+	Filtered slurmCounts
+	History  []delta
+}
+
+// saveState : 지금 store 를 path 에 원자적으로 (임시 파일 + fsync + rename). 잠금은 꺼낼 때만 (집합은 바뀌지 않는 값)
+func saveState(path string, s *store) error {
+	s.mu.RLock()
+	ss := savedState{Session: s.Session, Serial: s.Serial, Saved: time.Now(), History: s.History}
+	cur := s.Cur
+	s.mu.RUnlock()
+	if cur == nil {
+		return fmt.Errorf("no set")
+	}
+	ss.Built, ss.ASPAs, ss.TAs, ss.FailedTA, ss.Filtered = cur.Built, cur.ASPAs, cur.TAs, cur.FailedTA, cur.Filtered
+	ss.VRPs = make([]rtrVRP, 0, len(cur.VRPs))
+	for v := range cur.VRPs {
+		ss.VRPs = append(ss.VRPs, v)
+	}
+	ss.Keys = make([]rtrKey, 0, len(cur.Keys))
+	for k := range cur.Keys {
+		ss.Keys = append(ss.Keys, k)
+	}
+	ss.Full = cur.Full
+	ss.FullExp = make([]int64, len(cur.Full))
+	for i, k := range cur.Full {
+		ss.FullExp[i] = cur.FullExp[k].Unix()
+	}
+
+	tmp := path + ".tmp"
+	f, err := os.Create(tmp)
+	if err != nil {
+		return err
+	}
+	bw := bufio.NewWriterSize(f, 1<<20)
+	err = gob.NewEncoder(bw).Encode(&ss)
+	if err == nil {
+		err = bw.Flush()
+	}
+	if err == nil {
+		err = f.Sync() // rename 뒤 정전이 나도 내용이 디스크에
+	}
+	if cerr := f.Close(); err == nil {
+		err = cerr
+	}
+	if err != nil {
+		os.Remove(tmp)
+		return err
+	}
+	return os.Rename(tmp, path)
+}
+
+// loadSavedState : saveState 로 쓴 파일 -> session, serial, 집합, delta 기록
+func loadSavedState(path string) (*savedState, *payloadSet, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, nil, err
+	}
+	defer f.Close()
+	var ss savedState
+	if err := gob.NewDecoder(bufio.NewReaderSize(f, 1<<20)).Decode(&ss); err != nil {
+		return nil, nil, fmt.Errorf("%s: %w", path, err)
+	}
+	if len(ss.FullExp) != len(ss.Full) {
+		return nil, nil, fmt.Errorf("%s: broken (full %d / exp %d)", path, len(ss.Full), len(ss.FullExp))
+	}
+	p := &payloadSet{VRPs: make(map[rtrVRP]bool, len(ss.VRPs)), Keys: make(map[rtrKey]bool, len(ss.Keys)), ASPAs: ss.ASPAs,
+		Full: ss.Full, FullExp: make(map[vrpKey]time.Time, len(ss.Full)), Built: ss.Built, TAs: ss.TAs, FailedTA: ss.FailedTA,
+		Filtered: ss.Filtered}
+	if p.ASPAs == nil {
+		p.ASPAs = map[uint32][]uint32{}
+	}
+	for _, v := range ss.VRPs {
+		p.VRPs[v] = true
+	}
+	for _, k := range ss.Keys {
+		p.Keys[k] = true
+	}
+	for i, k := range ss.Full {
+		p.FullExp[k] = time.Unix(ss.FullExp[i], 0)
+	}
+	return &ss, p, nil
+}
+
+// ---- 0.2.0 전 저장 방식 (payload.gob 이 아직 없을 때 한 번만 씀, 다음 판에서 지움) ----
+
 // savedDeltas : delta 기록 (deltas.gob). 재시작 뒤에도 RTR Serial Query / json-delta 가 이어지게
 type savedDeltas struct {
 	Session uint16
@@ -417,6 +517,7 @@ type savedDeltas struct {
 	History []delta
 }
 
+// saveDeltas : 0.2.0 전 방식 (지금은 시험만 씀, loadDeltas 확인용)
 func saveDeltas(path string, s *store) error {
 	s.mu.RLock()
 	sd := savedDeltas{s.Session, s.Serial, s.History}

@@ -10,9 +10,11 @@ package main
 // 이 파일은 인증서 하나만 봄. 부모와의 관계 (서명, 자원 포함, 유효기간) 는 validate.go (2 단계).
 
 import (
+	"bytes"
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rsa"
+	"crypto/sha1"
 	"crypto/x509"
 	"encoding/asn1"
 	"fmt"
@@ -61,6 +63,7 @@ type rpkiCert struct {
 	Kind certKind
 
 	SKI, AKI []byte // 키 식별자 (AKI 는 TA 면 없을 수 있음)
+	SKIBad   bool   // SKI 가 공개 키의 SHA-1 이 아님 (RFC 6487 4.8.2). 지금은 경고만 (11-02, 거부는 보류)
 
 	// SIA (Subject Information Access)
 	CARepository string // CA : rsync://.../ (publication point 폴더)
@@ -173,6 +176,7 @@ func parseCertOpt(der []byte, wantEE, eeNoSIA bool) (*rpkiCert, error) {
 	if len(c.SKI) != 20 {
 		return nil, fmt.Errorf("SKI missing or not 20 bytes")
 	}
+	c.SKIBad = !skiMatchesKey(x)
 	if c.AKI != nil && len(c.AKI) != 20 {
 		return nil, fmt.Errorf("AKI not 20 bytes")
 	}
@@ -493,4 +497,18 @@ func (c *rpkiCert) routerKeys() ([]routerKey, error) {
 		}
 	}
 	return out, nil
+}
+
+// skiMatchesKey : SKI == SHA-1(subjectPublicKey) 인지 (RFC 6487 4.8.2 = RFC 5280 4.2.1.2 방법 1).
+// 해시 대상은 SubjectPublicKeyInfo 전체가 아니라 그 안 BIT STRING 의 값 (알고리즘 칸 제외)
+func skiMatchesKey(x *x509.Certificate) bool {
+	var spki struct {
+		Algorithm asn1.RawValue
+		PublicKey asn1.BitString
+	}
+	if rest, err := asn1.Unmarshal(x.RawSubjectPublicKeyInfo, &spki); err != nil || len(rest) != 0 {
+		return false
+	}
+	h := sha1.Sum(spki.PublicKey.Bytes)
+	return bytes.Equal(h[:], x.SubjectKeyId)
 }

@@ -11,9 +11,11 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"maps"
 	"net/http"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -154,27 +156,39 @@ func (d *daemon) handleMetrics(w http.ResponseWriter, r *http.Request) {
 	ses, ser, cur := d.st.Session, d.st.Serial, d.st.Cur
 	d.st.mu.RUnlock()
 	d.mu.Lock()
-	last, lastOK, runs, rtrOpen, view := d.last, d.lastOK, d.runs, d.rtrOpen, d.view
+	last, lastOK, runs, rtrOpen, view, started, handovers := d.last, d.lastOK, d.runs, d.rtrOpen, d.view, d.started, d.ho.Count
+	notApplied := maps.Clone(d.notApplied)
 	d.mu.Unlock()
 
+	// 이름 관례 (11-02, Prometheus) : 시각 = _timestamp_seconds, 바이트 = 원값, 누적 = _total, 판 = build_info
+	metric(bw, "haetae_build_info", "version of the running binary", "gauge", map[string]string{"version": version, "goversion": runtime.Version()}, 1)
+	metric(bw, "haetae_start_timestamp_seconds", "process start (epoch, kept over seamless upgrades)", "gauge", nil, float64(started.Unix()))
+	metric(bw, "haetae_handovers_total", "seamless upgrades of this process", "counter", nil, float64(handovers))
 	metric(bw, "haetae_session", "RTR session id", "gauge", nil, float64(ses))
 	metric(bw, "haetae_serial", "RTR serial", "gauge", nil, float64(ser))
 	metric(bw, "haetae_runs_total", "validation runs since start", "counter", nil, float64(runs))
+	head(bw, "haetae_runs_not_applied_total", "runs not applied, by reason (ta_failed, no_vrp, drop_held, tal, slurm)", "counter")
+	for _, k := range sortedKeys(notApplied) {
+		sample(bw, "haetae_runs_not_applied_total", map[string]string{"reason": k}, float64(notApplied[k]))
+	}
 	metric(bw, "haetae_rtr_open", "RTR listener open (1/0)", "gauge", nil, b2f(rtrOpen))
+	if age := d.dataAge(); age >= 0 {
+		metric(bw, "haetae_data_age_seconds", "Age of the served set (since validation)", "gauge", nil, age.Seconds())
+	}
 	if cur != nil {
 		metric(bw, "haetae_vrps", "VRPs served (unique, RTR)", "gauge", nil, float64(len(cur.VRPs)))
 		metric(bw, "haetae_vaps", "ASPA customers served", "gauge", nil, float64(len(cur.ASPAs)))
 		metric(bw, "haetae_router_keys", "router keys served", "gauge", nil, float64(len(cur.Keys)))
-		metric(bw, "haetae_data_time_seconds", "validation time of served data (epoch)", "gauge", nil, float64(cur.Built.Unix()))
+		metric(bw, "haetae_data_timestamp_seconds", "validation time of served data (epoch)", "gauge", nil, float64(cur.Built.Unix()))
 	}
 	if !lastOK.IsZero() {
-		metric(bw, "haetae_last_applied_seconds", "last time a new set was applied (epoch)", "gauge", nil, float64(lastOK.Unix()))
+		metric(bw, "haetae_last_applied_timestamp_seconds", "last time a new set was applied (epoch)", "gauge", nil, float64(lastOK.Unix()))
 	}
 	if last != nil {
-		metric(bw, "haetae_last_run_start_seconds", "last run start (epoch)", "gauge", nil, float64(last.Start.Unix()))
+		metric(bw, "haetae_last_run_start_timestamp_seconds", "last run start (epoch)", "gauge", nil, float64(last.Start.Unix()))
 		metric(bw, "haetae_last_run_duration_seconds", "last run duration", "gauge", nil, last.DurationS)
 		metric(bw, "haetae_last_run_applied", "last run applied (1/0)", "gauge", nil, b2f(last.Applied))
-		metric(bw, "haetae_last_run_downloaded_bytes", "bytes downloaded in last run", "gauge", nil, float64(last.MB<<20))
+		metric(bw, "haetae_last_run_downloaded_bytes", "bytes downloaded in last run", "gauge", nil, float64(last.Bytes))
 		head(bw, "haetae_vrps_per_ta", "VRPs per TA (last run)", "gauge")
 		for _, ta := range sortedKeys(last.PerTA) {
 			sample(bw, "haetae_vrps_per_ta", map[string]string{"ta": ta}, float64(last.PerTA[ta]))

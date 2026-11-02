@@ -42,12 +42,38 @@ const (
 	maxDeltasPerFetch   = 100     // 이보다 많이 밀렸으면 snapshot
 )
 
+// netError : 망 문제 (접속 / 시간 초과 / 5xx / 429 / 받는 도중 끊김). 저장소 내용이 틀린 것과 구별
+// delta 를 망 문제로 못 받았을 때 snapshot (수백 MB) 을 다시 받으러 가지 않으려고 씀
+type netError struct {
+	err        error
+	retryAfter time.Duration // 서버가 준 Retry-After (429 / 503, 없으면 0) -> 저장소 재시도 간격 (repo.go)
+}
+
+func (e *netError) Error() string { return e.err.Error() }
+func (e *netError) Unwrap() error { return e.err }
+
+func isNetError(err error) bool {
+	var ne *netError
+	return errors.As(err, &ne)
+}
+
 type rrdpState struct {
 	Notify      string    `json:"notify"`
 	Session     string    `json:"session"`
 	Serial      uint64    `json:"serial"`
 	LastSuccess time.Time `json:"last_success"`
+	// 조건부 GET (11-02) : 이 serial 까지 다 맞춘 notification 의 ETag / Last-Modified. 다음에 If-None-Match / If-Modified-Since 로 물어
+	// 304 면 받지 않음. 끝까지 맞추지 못한 상태 (delta 일부만) 는 비워 둠. NotifyAt = notification 을 마지막으로 통째로 받은 시각
+	ETag         string    `json:"etag,omitempty"`
+	LastModified string    `json:"last_modified,omitempty"`
+	NotifyAt     time.Time `json:"notify_at,omitzero"`
 }
+
+// rrdpFullEvery : 304 를 믿는 최대 시간. 이보다 오래 통째로 받지 않았으면 조건 없이 받음 (서버가 304 를 잘못 줘도 1 시간 안에 바로잡힘)
+const rrdpFullEvery = time.Hour
+
+// errNotModified : 조건부 GET 에 서버가 304 (notification 이 그대로)
+var errNotModified = errors.New("not modified")
 
 // notification.xml
 type rrdpNotification struct {
@@ -123,30 +149,53 @@ func newHTTPClient() *http.Client {
 // httpGet : url 을 tmpDir 의 임시 파일로 받음 (크기 상한, wantHash 가 있으면 SHA-256 확인)
 // 돌려준 파일은 부르는 쪽이 지움
 func (f *fetcher) httpGet(ctx context.Context, u string, max int64, wantHash string) (string, error) {
+	p, _, err := f.httpGetCond(ctx, u, max, wantHash, "", "")
+	return p, err
+}
+
+// httpGetCond : httpGet + 조건부 GET. etag / lastMod 를 주면 If-None-Match / If-Modified-Since,
+// 304 면 errNotModified. 돌려주는 헤더 = 응답의 ETag / Last-Modified 를 읽으려고
+func (f *fetcher) httpGetCond(ctx context.Context, u string, max int64, wantHash, etag, lastMod string) (string, http.Header, error) {
 	req, err := http.NewRequestWithContext(ctx, "GET", u, nil)
 	if err != nil {
-		return "", err
+		return "", nil, err
 	}
-	req.Header.Set("User-Agent", "haetae/0.1")
+	req.Header.Set("User-Agent", "haetae/"+version)
+	if etag != "" {
+		req.Header.Set("If-None-Match", etag)
+	}
+	if lastMod != "" {
+		req.Header.Set("If-Modified-Since", lastMod)
+	}
 	resp, err := f.client.Do(req)
 	if err != nil {
-		return "", err
+		return "", nil, &netError{err: err}
 	}
 	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusNotModified && (etag != "" || lastMod != "") {
+		return "", resp.Header, errNotModified
+	}
 	if resp.StatusCode != 200 {
-		return "", fmt.Errorf("HTTP %d", resp.StatusCode)
+		err := fmt.Errorf("HTTP %d", resp.StatusCode)
+		if resp.StatusCode >= 500 || resp.StatusCode == 429 {
+			// 서버 쪽 일시 문제. 4xx (없음 등) 는 내용 문제로 봄
+			return "", nil, &netError{err: err, retryAfter: parseRetryAfter(resp.Header.Get("Retry-After"))}
+		}
+		return "", nil, err
 	}
 	if resp.ContentLength > max {
-		return "", fmt.Errorf("too large (%d)", resp.ContentLength)
+		return "", nil, fmt.Errorf("too large (%d)", resp.ContentLength)
 	}
 	tmp, err := os.CreateTemp(f.tmpDir, "dl.*")
 	if err != nil {
-		return "", err
+		return "", nil, err
 	}
 	h := sha256.New()
 	n, err := io.Copy(io.MultiWriter(tmp, h), io.LimitReader(resp.Body, max+1))
 	tmp.Close()
-	if err == nil && n > max {
+	if err != nil {
+		err = &netError{err: err} // 받는 도중 끊김
+	} else if n > max {
 		err = fmt.Errorf("too large (> %d)", max)
 	}
 	if err == nil && wantHash != "" && !strings.EqualFold(hex.EncodeToString(h.Sum(nil)), wantHash) {
@@ -154,10 +203,24 @@ func (f *fetcher) httpGet(ctx context.Context, u string, max int64, wantHash str
 	}
 	if err != nil {
 		os.Remove(tmp.Name())
-		return "", err
+		return "", nil, err
 	}
 	f.addBytes(n)
-	return tmp.Name(), nil
+	return tmp.Name(), resp.Header, nil
+}
+
+// parseRetryAfter : 초 또는 HTTP 날짜. 모르면 0
+func parseRetryAfter(v string) time.Duration {
+	if v == "" {
+		return 0
+	}
+	if n, err := strconv.Atoi(v); err == nil && n > 0 {
+		return time.Duration(n) * time.Second
+	}
+	if t, err := http.ParseTime(v); err == nil {
+		return time.Until(t)
+	}
+	return 0
 }
 
 // sameOrigin : snapshot / delta 는 notification 과 같은 https 호스트
@@ -176,11 +239,26 @@ func validHash(h string) bool {
 }
 
 // fetchNotification : notification.xml 받기 + 검사
-func (f *fetcher) fetchNotification(ctx context.Context, notify string) (*rrdpNotification, uint64, error) {
-	tmp, err := f.httpGet(ctx, notify, maxNotificationSize, "")
-	if err != nil {
-		return nil, 0, fmt.Errorf("notification: %w", err)
+// fetchNotification : notification.xml 을 받아 확인. st 가 있으면 조건부 GET (304 = errNotModified, 그대로).
+// 돌려주는 헤더 = ETag / Last-Modified (다 맞춘 뒤 상태에 적음)
+func (f *fetcher) fetchNotification(ctx context.Context, notify string, st *rrdpState) (*rrdpNotification, uint64, http.Header, error) {
+	var etag, lastMod string
+	if st != nil && time.Since(st.NotifyAt) < rrdpFullEvery {
+		etag, lastMod = st.ETag, st.LastModified
 	}
+	tmp, hdr, err := f.httpGetCond(ctx, notify, maxNotificationSize, "", etag, lastMod)
+	if err == errNotModified {
+		return nil, 0, nil, err
+	}
+	if err != nil {
+		return nil, 0, nil, fmt.Errorf("notification: %w", err)
+	}
+	n, serial, err := parseNotification(notify, tmp)
+	return n, serial, hdr, err
+}
+
+// parseNotification : 받은 notification 파일을 읽고 확인 (같은 호스트, 해시 모양, serial)
+func parseNotification(notify, tmp string) (*rrdpNotification, uint64, error) {
 	defer os.Remove(tmp)
 	b, err := os.ReadFile(tmp)
 	if err != nil {
@@ -212,25 +290,44 @@ func (f *fetcher) fetchNotification(ctx context.Context, notify string) (*rrdpNo
 func (f *fetcher) syncRRDP(ctx context.Context, notify string) (string, rrdpResult, error) {
 	var res rrdpResult
 	dir, statePath := rrdpPaths(f.CacheDir, notify)
-	n, serial, err := f.fetchNotification(ctx, notify)
+	st, _ := loadRRDPState(statePath)
+	if st != nil {
+		// snapshot 을 바꿔 끼우다 (두 Rename 사이) 죽었으면 상태만 남고 폴더가 없음 -> 상태를 믿지 않고 snapshot
+		if fi, err := os.Stat(dir); err != nil || !fi.IsDir() || st.Notify != notify {
+			if err != nil || !fi.IsDir() {
+				f.logf("rrdp %s: state serial %d but no folder, taking snapshot", notify, st.Serial)
+			}
+			st = nil
+		}
+	}
+	n, serial, hdr, err := f.fetchNotification(ctx, notify, st)
+	if err == errNotModified {
+		// 304 : notification 이 지난번 (다 맞춘 것) 과 같음 = 폴더가 최신
+		res.Action, res.Serial = "none", st.Serial
+		st.LastSuccess = time.Now()
+		return dir, res, saveRRDPState(statePath, st)
+	}
 	if err != nil {
 		return dir, res, err
 	}
 	res.Serial = serial
-
-	st, _ := loadRRDPState(statePath)
-	if st != nil && st.Session == n.Session && st.Notify == notify {
+	// 다 맞추면 (none / delta / snapshot 성공) 이 notification 의 ETag / Last-Modified 를 적음
+	done := func(s *rrdpState) *rrdpState {
+		s.ETag, s.LastModified, s.NotifyAt = hdr.Get("ETag"), hdr.Get("Last-Modified"), time.Now()
+		return s
+	}
+	if st != nil && st.Session == n.Session {
 		if st.Serial == serial {
 			res.Action = "none"
 			st.LastSuccess = time.Now()
-			return dir, res, saveRRDPState(statePath, st)
+			return dir, res, saveRRDPState(statePath, done(st))
 		}
 		if st.Serial < serial && serial-st.Serial <= maxDeltasPerFetch {
-			files, done, dirty, err := f.applyDeltas(ctx, n, st, dir)
+			files, upTo, dirty, err := f.applyDeltas(ctx, n, st, dir)
 			if err == nil {
 				res.Action, res.Files = "delta", files
 				st.Serial, st.LastSuccess = serial, time.Now()
-				return dir, res, saveRRDPState(statePath, st)
+				return dir, res, saveRRDPState(statePath, done(st))
 			}
 			if dirty {
 				// delta 를 적용하다 실패 = 폴더가 어중간함 -> 상태 지우고 snapshot (상태가 없으면 이 폴더를 대체로도 안 씀)
@@ -238,12 +335,14 @@ func (f *fetcher) syncRRDP(ctx context.Context, notify string) (string, rrdpResu
 				os.Remove(statePath)
 			} else {
 				// 받기 실패 = 폴더는 done 까지 온전 -> 거기까지 기록 (다음 회차에 이어서, 직전 데이터로 대체 가능)
-				if done > st.Serial {
-					st.Serial = done
+				if upTo > st.Serial {
+					st.Serial = upTo
+					st.ETag, st.LastModified = "", "" // 끝까지 못 맞춤 : 다음에 조건 없이 받음
 					saveRRDPState(statePath, st)
 				}
-				if ctx.Err() != nil {
-					return dir, res, fmt.Errorf("delta (applied up to %d): %w", done, err)
+				if ctx.Err() != nil || isNetError(err) {
+					// 시간 초과 / 망 문제 : snapshot 도 같은 망으로 받아야 하니 여기서 그만 (직전 데이터로 대체, 다음 회차에 이어서)
+					return dir, res, fmt.Errorf("delta (applied up to %d): %w", upTo, err)
 				}
 				f.logf("rrdp %s: delta failed (%v), trying snapshot", notify, err)
 			}
@@ -255,7 +354,7 @@ func (f *fetcher) syncRRDP(ctx context.Context, notify string) (string, rrdpResu
 		return dir, res, err
 	}
 	res.Action, res.Files = "snapshot", files
-	return dir, res, saveRRDPState(statePath, &rrdpState{Notify: notify, Session: n.Session, Serial: serial, LastSuccess: time.Now()})
+	return dir, res, saveRRDPState(statePath, done(&rrdpState{Notify: notify, Session: n.Session, Serial: serial, LastSuccess: time.Now()}))
 }
 
 // applyDeltas : st.Serial+1 .. 최신 delta 를 차례로 적용 (중간이 빠졌으면 오류 -> snapshot)
@@ -301,6 +400,10 @@ func (f *fetcher) applySnapshot(ctx context.Context, n *rrdpNotification, serial
 	defer os.Remove(tmp)
 	newDir := dir + ".new"
 	os.RemoveAll(newDir)
+	// 객체가 하나도 없는 snapshot (빈 저장소) 도 폴더는 있어야 바꿔 끼움
+	if err := os.MkdirAll(newDir, 0755); err != nil {
+		return 0, err
+	}
 	cnt, err := applySnapshotFile(tmp, n.Session, serial, newDir)
 	if err != nil {
 		os.RemoveAll(newDir)
@@ -314,6 +417,7 @@ func (f *fetcher) applySnapshot(ctx context.Context, n *rrdpNotification, serial
 		}
 	}
 	if err := os.Rename(newDir, dir); err != nil {
+		os.Rename(old, dir) // 옛 폴더를 제자리로 (상태 파일은 옛 serial 그대로)
 		return cnt, err
 	}
 	os.RemoveAll(old)
@@ -338,7 +442,8 @@ func parseRRDPFile(path, kind, session string, serial uint64, dir string, fn fun
 		return 0, err
 	}
 	defer fh.Close()
-	d := newXMLDecoder(fh)
+	// encoding/xml 은 글자 덩어리 (publish 의 base64) 를 통째로 메모리에 올린 뒤 돌려줌 -> 읽기 단계에서 길이를 막음
+	d := newXMLDecoder(&textRunLimit{r: fh, max: maxTextRun})
 
 	count := 0
 	sawRoot := false
@@ -478,6 +583,28 @@ func applyDeltaFile(path, session string, serial uint64, dir string) (count int,
 		}
 	}
 	return count, false, nil
+}
+
+// maxTextRun : XML 안에서 '<' 없이 이어지는 글자 수 상한 = publish 하나의 base64 (객체 상한의 4/3) + 줄바꿈 / 공백 여유
+const maxTextRun = maxObjectSize/3*4*2 + 1<<20
+
+// textRunLimit : '<' 없이 max 바이트 넘게 이어지면 오류 (XML 해석 전에 거대한 요소 하나로 메모리가 터지는 것을 막음)
+type textRunLimit struct {
+	r   io.Reader
+	max int
+	run int // 마지막 '<' 뒤로 읽은 바이트 수
+}
+
+func (t *textRunLimit) Read(p []byte) (int, error) {
+	n, err := t.r.Read(p)
+	for _, c := range p[:n] {
+		if c == '<' {
+			t.run = 0
+		} else if t.run++; t.run > t.max {
+			return 0, fmt.Errorf("XML text longer than %d bytes", t.max)
+		}
+	}
+	return n, err
 }
 
 // newXMLDecoder : encoding 선언이 US-ASCII / UTF-8 / ISO-8859-1 이어도 받음

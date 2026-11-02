@@ -157,3 +157,78 @@ func TestNetDiff(t *testing.T) {
 		t.Fatalf("1->2: %v %v", ann, wdr)
 	}
 }
+
+// 라우터의 Error Report 본문 해석 (로그용) : 길이가 틀려도 panic 없이
+func TestErrorReportDetail(t *testing.T) {
+	pdu := []byte{1, 1, 0, 0, 0, 0, 0, 12, 0, 0, 0, 5} // v1 Serial Query
+	text := "no data\n"
+	b := binary.BigEndian.AppendUint32(nil, uint32(len(pdu)))
+	b = append(b, pdu...)
+	b = binary.BigEndian.AppendUint32(b, uint32(len(text)))
+	b = append(b, text...)
+	if got := errorReportDetail(b); got != `, PDU type 1 (v1), text "no data "` {
+		t.Errorf("got %q", got)
+	}
+	for _, bad := range [][]byte{nil, {0, 0, 0, 9}, {0, 0, 0, 0, 0, 0, 0, 9, 'a'}, b[:len(b)-3]} {
+		errorReportDetail(bad)
+	}
+	if got := errorReportDetail([]byte{0, 0, 0, 0, 0, 0, 0, 2, 'h', 'i'}); got != `, text "hi"` {
+		t.Errorf("no pdu: %q", got)
+	}
+}
+
+// 인터넷에 열 때의 제한 : 주소당 연결 수, 전체는 연결마다 1 분에 한 번 (넘으면 No Data, 연결은 유지)
+func TestRTRLimits(t *testing.T) {
+	st := &store{Session: 77}
+	st.update(mkSet([]rtrVRP{vr("10.0.0.0/8", 24, 65001)}, nil))
+	srv := &rtrServer{St: st, Refresh: 600, Retry: 300, Expire: 7200, Logf: t.Logf, MaxPerIP: 1,
+		Allow: []netip.Prefix{netip.MustParsePrefix("127.0.0.0/8")}}
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	go srv.serve(ln)
+
+	c1, err := net.Dial("tcp", ln.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c1.Close()
+	c1.Write(query(1, pduResetQuery, 0, nil))
+	if n := readUntilEOD(t, c1); n[pduEndOfData] != 1 {
+		t.Fatalf("first full: %v", n)
+	}
+	// 같은 주소 두 번째 연결 : 바로 끊김
+	c2, err := net.Dial("tcp", ln.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	c2.SetReadDeadline(time.Now().Add(2 * time.Second))
+	if _, err := c2.Read(make([]byte, 1)); err != io.EOF {
+		t.Errorf("second connection not closed: %v", err)
+	}
+	c2.Close()
+	// 1 분 안에 다시 Reset Query : Error Report (No Data), 연결은 그대로 -> Serial Query 는 됨
+	c1.Write(query(1, pduResetQuery, 0, nil))
+	if p := readPDU(t, c1); p.typ != pduErrorReport || p.field != errNoData {
+		t.Errorf("second full: type %d code %d", p.typ, p.field)
+	}
+	ser := st.Serial
+	c1.Write(query(1, pduSerialQuery, 77, &ser))
+	if n := readUntilEOD(t, c1); n[pduEndOfData] != 1 {
+		t.Errorf("serial query after limit: %v", n)
+	}
+	// 연결이 끝나면 자리가 돌아옴
+	c1.Close()
+	time.Sleep(100 * time.Millisecond)
+	c3, err := net.Dial("tcp", ln.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c3.Close()
+	c3.Write(query(1, pduResetQuery, 0, nil))
+	if n := readUntilEOD(t, c3); n[pduEndOfData] != 1 {
+		t.Errorf("after release: %v", n)
+	}
+}

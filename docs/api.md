@@ -1,6 +1,6 @@
 # Haetae API Guide
 
-This guide covers Haetae 0.1, an RPKI relying party written in Go. Haetae
+This guide covers Haetae 0.2.0, an RPKI relying party written in Go. Haetae
 publishes its results in three ways:
 
 1. **RTR** (RPKI-to-Router) for routers: TCP port 3323 by default. See [RTR](#rtr).
@@ -15,6 +15,7 @@ For installation, options, the configuration file and logging, see the
 - [Quick reference](#quick-reference)
 - [HTTP API](#http-api)
   - [Listening and access control](#listening-and-access-control)
+  - [Public access](#public-access)
   - [Common conventions](#common-conventions)
   - [Status](#status)
   - [History and metrics](#history-and-metrics)
@@ -33,6 +34,7 @@ For installation, options, the configuration file and logging, see the
 | Task | Endpoint |
 |---|---|
 | Is Haetae healthy? | `GET /status` (text), `GET /api/v1/status` (JSON) |
+| Health check for load balancers / monitoring | `GET /healthz` (200 or 503) |
 | Validate one route (RFC 6811) | `GET /api/v1/validity/AS13335/1.1.1.0/24` |
 | Check an AS_PATH against ASPA | `GET /api/v1/aspa/verify?path=64503+64502+64501` |
 | VRPs, ASPA and router keys of one AS | `GET /api/v1/as/13335` |
@@ -60,26 +62,87 @@ path per request.
 | Option | Config key | Default | Meaning |
 |---|---|---|---|
 | `-http` | `[http] listen` | `127.0.0.1:8323` | Listen address. Several addresses are separated by commas, for example `127.0.0.1:8323,0.0.0.0:8324`. All addresses serve the same API. An empty value disables HTTP. |
-| `-http-allow` | `[http] allow` | `127.0.0.1,::1` | Allowed client addresses or prefixes, comma separated. Applies to every `-http` address. |
+| `-http-allow` | `[http] allow` | `127.0.0.1,::1` | Internal clients: addresses or prefixes, comma separated, that may use every path. Applies to every `-http` address. |
+| `-http-public` | `[http] public` | (empty) | Public clients: addresses or prefixes that may use only the lookup paths listed in [Public access](#public-access). Empty = no public tier. |
 | `-jsonext` | `[http] jsonext` | `false` | Enables `/jsonext`. |
-| `-delta-full-interval` | `[http] delta-full-interval` | `60s` | Minimum interval between two full `/json-delta` responses per client address. `0` disables the limit. |
+| `-delta-full-interval` | `[http] delta-full-interval` | `60s` | Minimum interval between two full `/json-delta` responses per client, and between two public `/json` or `/csv` responses per client. `0` disables the limit; negative values are refused at start and on reload. |
 
-- A request from an address outside `-http-allow` gets `403 Forbidden`
-  (body `forbidden`). An empty allow list blocks everyone.
+- Each request is classified by its source address: in `-http-allow` ->
+  internal (all paths); otherwise in `-http-public` -> public (lookup paths
+  only); otherwise `403 Forbidden` (body `forbidden`). An address in both lists
+  is internal. Empty lists block everyone.
   IPv4-mapped IPv6 addresses are compared as IPv4.
-- `-http-allow`, `-jsonext` and `-delta-full-interval` change on
-  `systemctl reload haetae` (SIGHUP). Changing `-http` needs a restart.
-- The allow list is the only access control in Haetae. There is no
-  authentication and no TLS on the HTTP API. Treat the API as internal and also
-  restrict it with a host firewall. `/status`, `/api/v1/status` and `/metrics`
-  show the addresses of connected routers; do not expose them to the internet
-  without a filtering proxy in front.
+- `-http-allow`, `-http-public`, `-jsonext` and `-delta-full-interval` change
+  on `systemctl reload haetae` (SIGHUP), from the next request. Changing
+  `-http` needs a restart.
+- Per-client rate limits (full `/json-delta`, public `/json` and `/csv`) count
+  an IPv4 client by its address and an IPv6 client by its /64.
+- The allow lists are the only access control in Haetae. There is no
+  authentication and no TLS on the HTTP API; also restrict it with a host
+  firewall. The internal status (`/status`, `/api/v1/status`, `/metrics`)
+  shows the addresses of connected routers and local paths; keep
+  `-http-allow` to management networks and use `-http-public` for anything
+  wider, including the internet.
 
-Example: open the API on a second address for a management network.
+**Server limits.** Every listen address is opened at start-up. An address that
+cannot be bound (port in use, bad address) is logged
+(`http listen <addr>: ...`) and skipped; Haetae keeps running with the other
+addresses and RTR. Each listener accepts at most 256 concurrent connections
+(further connections wait in the kernel backlog). Timeouts: request header
+10 s, whole request 30 s, idle keep-alive connection 2 minutes; there is no
+write timeout, so large files can be downloaded over slow links. Request
+headers are limited to 64 KiB.
+
+Example: internal API for a management network on a second address.
 
 ```
 haetae -http 127.0.0.1:8323,0.0.0.0:8324 -http-allow 127.0.0.1,::1,192.0.2.0/24,2001:db8:100::/48
 ```
+
+### Public access
+
+`-http-public` opens a restricted view of the API to a wider set of clients,
+for example the whole internet:
+
+```ini
+[http]
+listen = 127.0.0.1:8323, 0.0.0.0:8324
+allow  = 127.0.0.1, ::1, 198.51.100.0/24      # management network: everything
+public = 0.0.0.0/0, ::/0                       # everyone else: lookups only
+```
+
+Recommended: expose the internet (or any untrusted network) only through
+`public`, and keep `allow` for management networks.
+
+Paths available to public clients:
+
+| Path | Notes |
+|---|---|
+| `GET /status`, `GET /api/v1/status` | Without internal fields: `rtr_clients`, `config`, `slurm`, `mem_mb`, `started`, `handover` and `last_run.mem_mb` are left out |
+| `GET /api/v1/validity/{AS}/{prefix}` | As for internal clients |
+| `GET /api/v1/as/{AS}`, `GET /api/v1/prefix/{prefix}` | As for internal clients |
+| `GET /api/v1/aspa/verify` | As for internal clients |
+| `GET /api/v1/vrps/delta` | As for internal clients |
+| `GET /json-delta` | As for internal clients (the full set is already limited per client) |
+| `GET /healthz` | As for internal clients |
+| `GET /json`, `GET /csv` | Once per `-delta-full-interval` per client, per file; within the interval `429` + `Retry-After` |
+
+Every other path (`/metrics`, `/api/v1/history`, `/api/v1/objects`,
+`/api/v1/expiring`, `/api/v1/ca`, `/api/v1/unsafe`, `/api/v1/slurm`,
+`/objects.jsonl`, `/jsonext`, `/repos.json`, `/rejects.txt`, ...) returns
+`403` with the body `not available on public access`.
+
+A public `/json` or `/csv` requested again too soon gets:
+
+```
+HTTP/1.1 429 Too Many Requests
+Retry-After: 42
+
+/json allowed once per 1m0s per client, retry after 42 s
+```
+
+Public clients that need regular updates should fetch the full set once and
+then follow `/json-delta?session=S&serial=N`.
 
 ### Common conventions
 
@@ -100,10 +163,10 @@ haetae -http 127.0.0.1:8323,0.0.0.0:8324 -http-allow 127.0.0.1,::1,192.0.2.0/24,
   | Code | Meaning |
   |---|---|
   | 400 | Bad input (the body gives the reason) |
-  | 403 | Client address not in `-http-allow` |
+  | 403 | Client address in neither `-http-allow` nor `-http-public` (`forbidden`), or a public client asked for an internal-only path (`not available on public access`) |
   | 404 | Not found (unknown URI, `/jsonext` disabled, delta range not kept, output file not written yet) |
-  | 429 | Full `/json-delta` requested again too soon; see `Retry-After` |
-  | 503 | No data yet (`no data yet (wait for first validation)`) |
+  | 429 | Full `/json-delta` (or, for public clients, `/json` / `/csv`) requested again too soon; see `Retry-After` |
+  | 503 | No data yet (`no data yet (wait for first validation)`); for `/healthz`, not healthy |
 
 - **After a restart.** Haetae reloads the previous VRP set from its output
   directory if it is newer than `-max-start-age` (default 2 hours). Endpoints
@@ -130,7 +193,7 @@ minutes is fine.
 
 ```json
 {
- "version": "haetae 0.1",
+ "version": "haetae 0.2.0",
  "started": "2026-11-01T09:18:02Z",
  "config": {"file": "/etc/haetae/haetae.conf", "loaded": "2026-11-01T09:18:02Z"},
  "session": 51234,
@@ -143,6 +206,7 @@ minutes is fine.
  "vrps": 1030620, "vaps": 3914, "router_keys": 3,
  "unsafe_vrps": 98,
  "rtr_open": true,
+ "stale": false,
  "rtr_clients": [
   {"remote": "192.0.2.10:51234", "transport": "tcp", "version": 1,
    "since": "2026-11-01T09:18:08Z", "last_query": "2026-11-01T09:28:08Z", "serial": 381}
@@ -156,12 +220,14 @@ minutes is fine.
   "counts": {"roa valid": 400374, "roa rejected": 23, "cer valid": 55955, "cer rejected": 23,
              "mft valid": 55867, "mft rejected": 85, "crl valid": 55867, "asa valid": 3918,
              "gbr valid": 1, "warn: AIA does not match issuer location": 4142},
-  "repos": {"rrdp ok": 104, "rrdp fallback-rsync": 11, "rsync ok": 1, "rsync failed": 10},
-  "announced": 5, "withdrawn": 2, "downloaded_mb": 16, "unsafe_vrps": 98, "mem_mb": 5200
+  "repos": {"rrdp ok": 104, "rrdp fallback-rsync": 1, "rrdp failed": 10, "rsync ok": 1, "rsync failed": 10},
+  "announced": 5, "withdrawn": 2, "downloaded_mb": 16, "downloaded_bytes": 16777216, "unsafe_vrps": 98, "mem_mb": 5200
  },
  "repos_problems": [
-  {"uri": "https://rrdp.example.net/notification.xml", "type": "rrdp", "result": "fallback-rsync",
-   "start": "2026-11-01T09:21:11Z", "duration_ns": 300000000000, "error": "..."}
+  {"uri": "https://rrdp.example.net/notification.xml", "type": "rrdp", "result": "failed",
+   "start": "2026-11-01T09:21:11Z", "duration_ns": 300000000000, "error": "... / rsync rsync://rrdp.example.net/repo failed",
+   "consecutive_failures": 4, "last_success": "2026-11-01T07:02:40Z",
+   "next_try": "2026-11-01T09:41:11Z"}
  ],
  "mem_mb": 5230
 }
@@ -177,15 +243,21 @@ minutes is fine.
 | `runs` | Validation runs since the process started. |
 | `vrps`, `vaps`, `router_keys` | Unique VRPs, ASPA customers and router keys served over RTR (after SLURM). |
 | `unsafe_vrps` | See [/api/v1/unsafe](#get-apiv1unsafe). Present after the first run. |
-| `rtr_open` | Whether the RTR listener is open. |
+| `rtr_open` | `true` only when every configured RTR listener (plain TCP and TLS) is open. A listener that failed to open (for example, port in use) is retried after each applied run. |
+| `stale` | `true` while the served set was validated longer ago than `-stale-warn` (default 1 hour; always `false` when it is 0). Checked every minute. See [GET /healthz](#get-healthz). |
 | `rtr_clients` | Connected routers, or `null`. `transport` is `tcp`, `tcp-md5`, `tcp-ao` or `tls`. `version` is the negotiated RTR version (`-1` before the first PDU). `serial` is the last serial sent. Routers connected over SSH appear as `127.0.0.1` with `tcp`. |
 | `tas` | Trust anchor certificates, the starting points for [/api/v1/ca](#get-apiv1cauri). |
 | `last_run` | The last run. `applied: false` means Haetae kept serving the previous set; `reason` says why (for example a failed TA or a VRP drop held by `-hold-drop`). `reason` can also carry a warning when `applied` is true (`WARNING VRP drop ...`). `failed_tas` lists TAs that failed. |
 | `last_run.counts` | Keys are `<type> valid` or `<type> rejected` (type = `cer crl mft roa asa gbr spl tak`), `warn: <message>`, and `unknown file type .<ext>` for non-standard files. |
 | `last_run.repos` | Keys are `<rrdp|rsync> <result>`; see [/repos.json](#get-reposjson). |
-| `repos_problems` | Repositories whose result is not `ok`. |
-| `slurm` | Present only when a SLURM file is configured: `{"file", "loaded", "filtered": {"vrps", "router_keys", "aspas"}, "added": {"vrps", "router_keys", "aspas"}}`. |
+| `repos_problems` | Repositories whose result is not `ok`, with the same fields as [/repos.json](#get-reposjson) (including `consecutive_failures`, `next_try`, `skipped`). |
+| `slurm` | Present only when a SLURM file is configured: `{"file", "loaded", "filtered": {"vrps", "router_keys", "aspas"}, "added": {"vrps", "router_keys", "aspas"}, "error"}`. `error` is present only while the SLURM file cannot be read; cycles are then skipped (`last_run.applied` false, `last_run.reason` starts with `SLURM`) and the previous set is kept. |
 | `mem_mb` | Current resident memory. |
+| `handover` | Seamless upgrades of this process (manual 6.7; during one, `/api/v1/objects`, `/expiring`, `/ca` and `/unsafe` answer 503 for about 40 s while the new binary rebuilds the lookup data from the cache): `count` (upgrades so far, `0` after a restart), `last_at`, `from` (previous version), `pause_ms` (how long RTR was paused), `rtr_conns` (connections taken over), `last_error` / `last_error_at` (last aborted upgrade). |
+
+For public clients (`-http-public`) the fields `rtr_clients`, `config`,
+`slurm`, `mem_mb`, `started`, `handover` and `last_run.mem_mb` are omitted; the text form
+leaves out the same lines.
 
 #### GET /status
 
@@ -193,7 +265,7 @@ The same information as plain text for humans:
 
 ```
 $ curl -s localhost:8323/status
-version:       haetae 0.1
+version:       haetae 0.2.0
 started:       2026-11-01T09:18:02Z
 session:       51234
 serial:        381
@@ -205,6 +277,55 @@ repos:         map[rrdp ok:104 ...]
 rtr-client:    192.0.2.10:51234 v1 since 2026-11-01T09:18:08Z serial 381
 repo-problem:  rrdp fallback-rsync https://rrdp.example.net/notification.xml
 ```
+
+#### GET /healthz
+
+A small health check for load balancers and monitoring systems. Available to
+internal and public clients.
+
+```
+$ curl -s -w ' %{http_code}\n' localhost:8323/healthz
+{"data_age_s":312,"last_run":{"applied":true,"reason":"","start":"2026-11-01T09:21:10Z"},"rtr_open":true,"serial":381,"status":"ok"} 200
+```
+
+The HTTP status is `200` when `status` is `ok`, otherwise `503` with the same
+JSON body.
+
+| `status` | Meaning |
+|---|---|
+| `ok` | A set is served, it is not stale, and RTR is open (if configured) |
+| `starting` | No set yet: the first applied run has not finished and no saved set was usable |
+| `stale` | The served set was validated longer ago than `-stale-warn` (`[validation] stale-warn`, default `1h`) |
+| `rtr-closed` | An RTR address (`-rtr`) is configured but RTR is not open: before the first applied run, a listener could not be opened, or `-stale-close` closed it |
+
+When several apply, the first in this table wins.
+
+| Field | Meaning |
+|---|---|
+| `status` | See above |
+| `serial` | Current RTR serial |
+| `rtr_open` | As in [/api/v1/status](#get-apiv1status) |
+| `data_age_s` | Seconds since the served set was validated. Absent while `starting` |
+| `last_run` | `start`, `applied`, `reason` of the last run (absent before the first run) |
+
+**Stale data.** Every minute, independently of runs, Haetae compares the age
+of the served set with two limits:
+
+- `-stale-warn` (`[validation] stale-warn`, default `1h`, `0` = off): log
+  `WARNING stale data: set built ... ago (stale-warn 1h0m0s)` when the state
+  changes and every 30 minutes while it lasts, `stale: true` in the status,
+  `/healthz` 503 `stale`. `stale data cleared` is logged when a newer set is
+  applied.
+- `-stale-close` (`[rtr] stale-close`, default `0` = off, otherwise at least
+  `30m`): the RTR listeners are closed and all router sessions are dropped
+  (log `rtr closed (...), N connections dropped`), so routers fail over to
+  another RP. RTR is opened again when a new set is applied.
+
+Both change on `systemctl reload haetae`, effective at the next check (within
+a minute). Use `-stale-close` only when the routers have another RP
+configured; otherwise leave it off, because a router keeps the data it already
+has until its RTR expire interval runs out (RFC 8210), which is usually better
+than no connection.
 
 ### History and metrics
 
@@ -239,16 +360,21 @@ start with `haetae_`.
 
 | Metric | Labels | Meaning |
 |---|---|---|
+| `haetae_build_info` | `version`, `goversion` | Always 1; the labels tell the running version |
+| `haetae_start_timestamp_seconds` | | Process start (epoch); kept over seamless upgrades |
+| `haetae_handovers_total` | | Seamless upgrades of this process (counter) |
 | `haetae_session`, `haetae_serial` | | RTR session ID and serial |
 | `haetae_runs_total` | | Runs since start (counter) |
+| `haetae_runs_not_applied_total` | `reason` | Runs not applied, by reason: `ta_failed`, `no_vrp`, `drop_held`, `tal`, `slurm` (counter) |
 | `haetae_rtr_open` | | RTR listener open (1 / 0) |
 | `haetae_rtr_clients` | | Connected RTR clients |
 | `haetae_vrps`, `haetae_vaps`, `haetae_router_keys` | | Served payload counts |
-| `haetae_data_time_seconds` | | Validation time of served data (epoch) |
-| `haetae_last_applied_seconds` | | Last time a run was applied (epoch) |
-| `haetae_last_run_start_seconds`, `haetae_last_run_duration_seconds` | | Last run start (epoch) and duration |
+| `haetae_data_timestamp_seconds` | | Validation time of served data (epoch) |
+| `haetae_data_age_seconds` | | Age of the served set since validation (seconds). Absent before the first set |
+| `haetae_last_applied_timestamp_seconds` | | Last time a run was applied (epoch) |
+| `haetae_last_run_start_timestamp_seconds`, `haetae_last_run_duration_seconds` | | Last run start (epoch) and duration |
 | `haetae_last_run_applied` | | Last run applied (1 / 0) |
-| `haetae_last_run_downloaded_bytes` | | Bytes downloaded in the last run (MB resolution) |
+| `haetae_last_run_downloaded_bytes` | | Bytes downloaded in the last run |
 | `haetae_vrps_per_ta` | `ta` | VRPs per trust anchor |
 | `haetae_objects` | `type`, `state` | Objects by type and `valid` / `rejected` |
 | `haetae_warnings` | `warning` | Warning counts |
@@ -256,7 +382,7 @@ start with `haetae_`.
 | `haetae_unsafe_vrps` | | Unsafe VRPs |
 | `haetae_memory_rss_bytes` | | Resident memory |
 
-A useful alert: `time() - haetae_data_time_seconds > 1800`.
+A useful alert: `haetae_data_age_seconds > 1800` (or `time() - haetae_data_timestamp_seconds > 1800`).
 
 ### Full VRP sets
 
@@ -392,8 +518,9 @@ response is the full set with `"reset": true`.
 - Returns 503 if there is no data yet.
 
 **Rate limit on full sets.** A full response (`reset: true`) is about 85 MB and
-one second of CPU. Each client address may receive one per
-`-delta-full-interval` (default 60 seconds). A second full request within the
+one second of CPU. Each client (IPv4 address, or IPv6 /64) may receive one per
+`-delta-full-interval` (default 60 seconds). This applies to internal and
+public clients alike. A second full request within the
 interval gets:
 
 ```
@@ -418,9 +545,10 @@ not treat 429 as an empty set.
 3. Optionally compare with a full set once a day.
 
 A new session (and therefore one full reset) happens when Haetae starts without
-a usable previous result (missing, or older than `-max-start-age`).
+a usable saved state (`payload.gob` missing, unreadable or older than
+`-max-start-age`).
 
-#### GET /api/v1/vrps/delta?serial=N
+#### GET /api/v1/vrps/delta?serial=N[&session=S]
 
 Older, VRP-only form. Kept for compatibility; prefer `/json-delta`.
 
@@ -430,9 +558,11 @@ Older, VRP-only form. Kept for compatibility; prefer `/json-delta`.
  "withdrawn":[]}
 ```
 
-`serial` is required (400 otherwise). If `N` is not in the history, the
-response has `"reset": true` and no lists; fetch a full set from `/json` or
-`/json-delta`. There is no session check.
+`serial` is required (400 otherwise). `session` is optional; give the session
+from the previous response. If `N` is not in the history, or `session` is
+given and differs from the current session (Haetae restarted with a new
+session), the response has `"reset": true` and no lists; fetch a full set from
+`/json` or `/json-delta`. Without `session` there is no session check.
 
 ### Route origin validation
 
@@ -595,7 +725,7 @@ below.
 | `type` | `cer` (TA, CA and router certificates), `crl`, `mft`, `roa`, `asa` (ASPA), `gbr`, `spl`, `tak` |
 | `parent` | URI of the issuing CA certificate |
 | `notBefore`, `notAfter` | Validity of the object's own certificate. For `mft` and `crl`: thisUpdate and nextUpdate |
-| `status`, `reason` | `valid` or `rejected`; `reason` is present for rejected objects |
+| `status`, `reason` | `valid` or `rejected`; `reason` is present for rejected objects. A rejected certificate whose kind is known has `summary: {"kind": ...}` only (none if it could not be parsed at all) |
 | `summary` | Depends on the type (below) |
 
 | Type | `summary` |
@@ -607,7 +737,7 @@ below.
 | `gbr` | `vcard` `{FN, ORG, EMAIL, TEL, ADR}`, `warnings` |
 | `spl` | `asn`, `prefixes` |
 | `tak` | `current`, `predecessor`, `successor` (key identifiers) |
-| `mft` | `number`, `files` |
+| `mft` | `number`, `files`; `fallback: true` when the fetched manifest failed and the last valid copy of the publication point was used (RFC 9286 section 6.7, daemon mode only) |
 | `crl` | `revoked` |
 
 #### GET /api/v1/objects
@@ -617,6 +747,7 @@ Search objects. All conditions are optional and combined with AND.
 | Parameter | Meaning |
 |---|---|
 | `type` | Object type (see above) |
+| `kind` | Certificate kind: `TA`, `CA` or `router` (the `summary.kind` value; any other value is a 400 error). `kind=router` lists BGPsec router certificates, including rejected ones |
 | `ta` | TA name: `afrinic`, `apnic`, `arin`, `lacnic`, `ripe` |
 | `status` | `valid` or `rejected` |
 | `uri` | URI prefix match |
@@ -628,6 +759,7 @@ Search objects. All conditions are optional and combined with AND.
 ```
 curl -s 'localhost:8323/api/v1/objects?type=roa&as=13335&limit=100'
 curl -s 'localhost:8323/api/v1/objects?status=rejected&ta=ripe'
+curl -s 'localhost:8323/api/v1/objects?kind=router'
 ```
 
 ```json
@@ -737,11 +869,29 @@ Fetch result of every repository in the last applied run.
 | `result` | Meaning |
 |---|---|
 | `ok` | Fetched normally |
-| `fallback-rsync` | RRDP failed; rsync was used |
-| `fallback-old` | Fetch failed; previously fetched data was used |
-| `failed` | Fetch failed and nothing usable was available |
+| `fallback-old` | RRDP only: the fetch failed, but the last successful RRDP fetch is less than 1 hour old (3 hours for repositories with 10,000 or more objects), so that data was used without trying rsync |
+| `fallback-rsync` | RRDP only: RRDP failed (for more than 1 / 3 hours) and rsync **succeeded** |
+| `failed` | The fetch failed. On an RRDP row: rsync also failed (the error ends with ` / rsync <module> failed`) or rsync is disabled |
+
+Even after `failed`, previously fetched data (RRDP first) is still validated while its manifest is valid, so VRPs do not
+disappear at once.
 
 `action` (RRDP) is `none`, `delta` or `snapshot`. `error` is present on failure.
+
+Retry state (present only when set):
+
+| Field | Meaning |
+|---|---|
+| `consecutive_failures` | Failed attempts in a row (0 / absent after a success) |
+| `last_success` | Last successful fetch since the process started |
+| `next_try` | The repository is not contacted before this time |
+| `skipped` | `true` if this run did not contact the repository because of `next_try`; the result is then `fallback-old`, `fallback-rsync` or `failed` as for a failure, with the error `skipped after N failures until <time> (last: <error>)` |
+
+After 3 failures in a row a repository (RRDP notification URI or rsync
+module) waits 10 minutes before the next attempt, then 20, 40, at most
+1 hour; a success resets it. A `Retry-After` header on a 429 or 503 response
+(seconds or an HTTP date) is honoured when it is longer, up to 1 hour. The
+counters are kept in memory and start from zero after a restart.
 
 #### GET /rejects.txt
 
@@ -763,6 +913,10 @@ when a run is applied.
 | `repos.json` | `/repos.json` | Repository fetch results |
 | `summary.txt` | (none) | Counts by type and warning, with a few examples per warning |
 
+Content types (0.2.0): `/json` and `/repos.json` = `application/json`, `/csv` = `text/csv`,
+`/objects.jsonl` = `application/jsonl`, `/rejects.txt` = `text/plain`. Range and
+`If-Modified-Since` requests are supported.
+
 ### objects.jsonl
 
 One [object record](#object-record) per line, for every object Haetae
@@ -774,9 +928,12 @@ jq -r 'select(.status=="rejected") | [.type, .uri, .reason] | @tsv' objects.json
 ```
 
 The state directory (`-state`, default `/var/lib/haetae/state`) holds
-`state.json` (session and serial), `deltas.gob` (the last 200 serials of
-changes), `history.jsonl` (run history) and a lock file. These are internal
-formats; use the API instead of reading them.
+`payload.gob` (restart state: the set served over RTR after SLURM, session,
+serial and the last 200 serials of changes, written atomically after every
+applied run), `state.json` (session and serial, for humans),
+`history.jsonl` (run history) and a lock file. The cache directory also holds
+`valid/`, the last valid copy of each publication point (manifest fallback).
+These are internal formats; use the API instead of reading them.
 
 ## RTR
 
@@ -789,6 +946,8 @@ formats; use the API instead of reading them.
 | Versions | 0 (RFC 6810), 1 (RFC 8210), 2 (draft-ietf-sidrops-8210bis, ASPA) |
 | Payload | v0: IPv4 / IPv6 Prefix. v1: + Router Key. v2: + ASPA |
 | Timers (v1, v2) | refresh 600, retry 300, expire 7200 seconds |
+| Stale data | `-stale-close` (`[rtr] stale-close`, default off): close RTR and drop all sessions when the served set is older than this, so routers fail over. See [GET /healthz](#get-healthz) |
+| Limits | `-rtr-max-conns` (256) concurrent connections, `-rtr-max-per-ip` (4, IPv6 per /64) per address; extra connections are closed. First PDU within 30 s, then at least one PDU per 2 hours, or the connection is closed. A full set (Reset Query) at most once a minute per connection; otherwise Error Report code 2 "No Data Available" and the session stays up |
 
 ### Version negotiation
 
@@ -879,17 +1038,25 @@ End of Data.
 - The serial increases by one each time the served set changes (normally at
   most once per run, every 10 minutes by default). If a run produces the same
   set, the serial stays.
-- Haetae saves the session ID, serial and the last 200 serials of changes in
-  its state directory. After a restart, routers reconnect and continue with a
+- After every applied run, Haetae saves the served set (after SLURM), the
+  session ID, serial and the last 200 serials of changes together in one file
+  (`state/payload.gob`, temporary file + fsync + rename). After a restart
+  (about 1.6 s to load about 1M VRPs), routers reconnect and continue with a
   Serial Query; they do not need a full reload.
-- At start, if the previous VRP set is present and no older than
-  `-max-start-age` (default 2 hours), Haetae opens RTR immediately with that
-  set. Otherwise it picks a new random session ID, waits for the first
-  successful validation and only then opens RTR. Routers see the new session
-  and reload the full set. Haetae never serves an empty set as its first answer.
-- If a run fails badly (a TA fails, or no VRPs at all), the previous set stays
-  in service. With `-hold-drop`, a large drop in VRPs is also held back (see the
+- At start, if the saved set is no older than `-max-start-age` (default
+  2 hours), Haetae opens RTR immediately with that set. If it is older or the
+  file is unreadable, Haetae picks a new random session ID (always different
+  from the old one), waits for the first applied run and only then opens RTR.
+  Routers see the new session and reload the full set. Haetae never serves an
+  empty set as its first answer.
+- A run in which a TA fails, or with no VRPs at all, is never applied, even
+  the first run after start (no previous set): RTR does not open with a
+  partial set; the previous set (if any) stays in service. With `-hold-drop`, a large drop in VRPs is also held back (see the
   [manual](manual.md)).
+- On `SIGTERM` / `SIGINT` (`systemctl stop` or `restart`), Haetae closes the
+  RTR listeners and drops all router sessions, lets HTTP requests in progress
+  finish (up to 5 s), waits for an apply / save in progress (up to 60 s) and
+  exits with code 0. Routers reconnect after their retry interval.
 
 ### Transport security
 

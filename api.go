@@ -5,7 +5,7 @@ package main
 //   /status, /api/v1/status         상태 (text / JSON) : serial, 회차 결과, TA 별 개수, RTR 클라이언트, 저장소 (E3)
 //   /json /csv /objects.jsonl /rejects.txt /repos.json   마지막 출력 파일 그대로 (E1, E6)
 //   /api/v1/validity/<AS>/<prefix>  경로 검증 (RFC 6811, Routinator 호환 모양, E2)
-//   /api/v1/vrps/delta?serial=N     N 이후 바뀐 VRP (받아 가는 시스템용, E5). 기록 없으면 reset=true
+//   /api/v1/vrps/delta?serial=N[&session=S]  N 이후 바뀐 VRP (받아 가는 시스템용, E5). 기록 없거나 session 이 다르면 reset=true
 //   나머지 조회 API 는 api_query.go, /api/v1/history /metrics 는 history.go
 // 형식은 docs/api.md 와 같게 유지 (바꾸면 문서 먼저). 쓰기 기능 없음 (모두 GET, 조회만)
 
@@ -48,7 +48,7 @@ func (d *daemon) apiHandler() http.Handler {
 	for _, name := range []string{"json", "csv", "objects.jsonl", "rejects.txt", "repos.json"} {
 		name := name
 		mux.HandleFunc("GET /"+name, func(w http.ResponseWriter, r *http.Request) {
-			http.ServeFile(w, r, filepath.Join(d.cfg.OutDir, name))
+			d.serveOut(w, r, name)
 		})
 	}
 	mux.HandleFunc("GET /status", d.handleStatusText)
@@ -67,11 +67,29 @@ func (d *daemon) apiHandler() http.Handler {
 	mux.HandleFunc("GET /api/v1/slurm", d.handleSLURM)
 	mux.HandleFunc("GET /api/v1/history", d.handleHistory)
 	mux.HandleFunc("GET /metrics", d.handleMetrics)
+	mux.HandleFunc("GET /healthz", d.handleHealthz)
 	return mux
 }
 
-// statusData : 상태 한 덩어리
-func (d *daemon) statusData() map[string]any {
+// outTypes : 출력 파일의 Content-Type (파일 이름에 확장자가 없어 ServeFile 이 맞히지 못함)
+var outTypes = map[string]string{
+	"json":          "application/json",
+	"csv":           "text/csv; charset=utf-8",
+	"objects.jsonl": "application/jsonl",
+	"rejects.txt":   "text/plain; charset=utf-8",
+	"repos.json":    "application/json",
+}
+
+// serveOut : 출력 폴더의 파일 하나 (Range / If-Modified-Since 는 ServeFile 이 처리)
+func (d *daemon) serveOut(w http.ResponseWriter, r *http.Request, name string) {
+	if t := outTypes[name]; t != "" {
+		w.Header().Set("Content-Type", t)
+	}
+	http.ServeFile(w, r, filepath.Join(d.cfg.OutDir, name))
+}
+
+// statusData : 상태 한 덩어리. public = 공개 쪽 (라우터 주소, 설정 / SLURM 파일, 메모리 뺌)
+func (d *daemon) statusData(public bool) map[string]any {
 	d.st.mu.RLock()
 	ses, ser, cur, upd := d.st.Session, d.st.Serial, d.st.Cur, d.st.Updated
 	hist := len(d.st.History)
@@ -79,7 +97,7 @@ func (d *daemon) statusData() map[string]any {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	m := map[string]any{
-		"version":        "haetae 0.1",
+		"version":        "haetae " + version,
 		"started":        d.started,
 		"config":         map[string]any{"file": d.confPath, "loaded": d.confAt}, // 설정 파일과 마지막으로 읽은 시각 (시작 / reload)
 		"session":        ses,
@@ -90,15 +108,20 @@ func (d *daemon) statusData() map[string]any {
 		"runs":           d.runs,
 		"last_run":       d.last,
 		"rtr_open":       d.rtrOpen,
+		"stale":          d.stale, // 집합이 stale-warn 보다 오래됨 (ops.go)
 		"repos_problems": problemRepos(d.repos),
 		"tas":            d.tas,
 		"mem_mb":         memRSS() >> 20,
+		"handover":       d.ho, // 무중단 판 올리기 (handover.go)
 	}
 	if d.view != nil {
 		m["unsafe_vrps"] = len(d.view.Unsafe)
 	}
 	if slurmFile := d.c().SLURM; slurmFile != "" {
 		sl := map[string]any{"file": slurmFile, "loaded": d.slurmAt}
+		if d.slurmErr != "" {
+			sl["error"] = d.slurmErr // 이 동안 회차는 반영하지 않음 (직전 집합 유지)
+		}
 		if cur != nil {
 			sl["filtered"] = cur.Filtered
 		}
@@ -114,6 +137,16 @@ func (d *daemon) statusData() map[string]any {
 	if d.rtr != nil {
 		m["rtr_clients"] = d.rtr.clientsInfo()
 	}
+	if public {
+		for _, k := range []string{"rtr_clients", "config", "slurm", "mem_mb", "started", "handover"} {
+			delete(m, k)
+		}
+		if ri, ok := m["last_run"].(*runInfo); ok && ri != nil {
+			c := *ri
+			c.MemMB = 0
+			m["last_run"] = &c
+		}
+	}
 	return m
 }
 
@@ -128,11 +161,22 @@ func problemRepos(rs []repoStatus) []repoStatus {
 }
 
 func (d *daemon) handleStatusJSON(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, d.statusData())
+	writeJSON(w, d.statusData(false))
+}
+
+func (d *daemon) handleStatusJSONPublic(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, d.statusData(true))
 }
 
 func (d *daemon) handleStatusText(w http.ResponseWriter, r *http.Request) {
-	m := d.statusData()
+	writeStatusText(w, d.statusData(false))
+}
+
+func (d *daemon) handleStatusTextPublic(w http.ResponseWriter, r *http.Request) {
+	writeStatusText(w, d.statusData(true))
+}
+
+func writeStatusText(w http.ResponseWriter, m map[string]any) {
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 	keys := []string{"version", "started", "session", "serial", "data_time", "set_updated", "last_applied", "runs", "vrps", "vaps", "router_keys", "unsafe_vrps", "rtr_open", "mem_mb"}
 	for _, k := range keys {
@@ -260,6 +304,10 @@ func (d *daemon) handleDelta(w http.ResponseWriter, r *http.Request) {
 	ses, ser := d.st.Session, d.st.Serial
 	ann, wdr, _, _, _, ok := d.st.netDiff(uint32(from))
 	d.st.mu.RUnlock()
+	// session 을 주면 확인 : 다르면 (재시작으로 새 session) 같은 serial 이라도 다른 집합 -> reset
+	if s := r.URL.Query().Get("session"); s != "" && s != strconv.Itoa(int(ses)) {
+		ok = false
+	}
 
 	conv := func(vs []rtrVRP) []valVRP {
 		out := make([]valVRP, 0, len(vs))

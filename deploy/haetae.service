@@ -8,6 +8,12 @@ After=network-online.target time-sync.target
 Wants=network-online.target
 
 [Service]
+# Type=notify (0.2.0) : 해태가 듣기 소켓을 연 뒤 READY=1, 살아 있으면 WATCHDOG=1 (ops.go).
+#   3 분 동안 알림이 없으면 (교착, 1 시간 넘는 회차) systemd 가 죽이고 Restart=on-failure 로 다시 띄움.
+#   실행 파일과 함께 바꿀 것 : 0.2.0 전 실행 파일은 READY 를 보내지 않아 시작이 시간 초과됨
+Type=notify
+NotifyAccess=main
+WatchdogSec=3min
 User=haetae
 Group=haetae
 StateDirectory=haetae
@@ -25,6 +31,8 @@ PrivateTmp=yes
 ReadWritePaths=/var/lib/haetae
 # 한 회차 실제 사용 (anon) 약 5 GB + 파일 캐시. 8G 면 파일 캐시로 swap 을 씀
 MemoryMax=12G
+# Go 쓰레기 수거 목표 (0.2.0) : 9 GiB 가까이 가면 GC 를 더 자주 돌려 MemoryMax 에 닿지 않게 (넘어도 죽지 않는 부드러운 상한)
+Environment=GOMEMLIMIT=9GiB
 LimitNOFILE=65536
 
 [Install]

@@ -41,6 +41,10 @@ var confKeys = map[string]string{
 	"validation.drop-warn":     "drop-warn",
 	"validation.hold-drop":     "hold-drop",
 	"validation.max-start-age": "max-start-age",
+	"validation.stale-warn":    "stale-warn",
+	"rtr.stale-close":          "stale-close",
+	"rtr.max-conns":            "rtr-max-conns",
+	"rtr.max-per-ip":           "rtr-max-per-ip",
 
 	"rtr.listen":  "rtr",
 	"rtr.allow":   "rtr-allow",
@@ -56,6 +60,7 @@ var confKeys = map[string]string{
 
 	"http.listen":              "http",
 	"http.allow":               "http-allow",
+	"http.public":              "http-public",
 	"http.jsonext":             "jsonext",
 	"http.delta-full-interval": "delta-full-interval",
 }

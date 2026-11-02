@@ -160,7 +160,7 @@ func (v *validator) writeOutputs(dir string, started time.Time) error {
 		return err
 	}
 
-	sort.Slice(v.objects, func(i, j int) bool { return v.objects[i].URI < v.objects[j].URI })
+	v.sortObjects()
 	err = writeAtomic(dir, "objects.jsonl", func(w *bufio.Writer) error {
 		enc := json.NewEncoder(w)
 		for i := range v.objects {
@@ -204,4 +204,9 @@ func (v *validator) writeOutputs(dir string, started time.Time) error {
 		}
 		return nil
 	})
+}
+
+// sortObjects : 객체 목록을 URI 순으로 (조회 API 의 이분 탐색, queryView.object)
+func (v *validator) sortObjects() {
+	sort.Slice(v.objects, func(i, j int) bool { return v.objects[i].URI < v.objects[j].URI })
 }

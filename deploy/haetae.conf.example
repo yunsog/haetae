@@ -30,6 +30,7 @@ rsync    = true                      # fall back to rsync when RRDP keeps failin
 workers       = 32                   # validation workers (default = number of CPUs)                 option -j
 drop-warn     = 0.1                  # warn when VRPs drop by more than this fraction                option -drop-warn
 hold-drop     = false                # on such a drop, keep serving the previous VRPs                option -hold-drop
+stale-warn    = 1h                   # warn / status stale / healthz 503 when the set is older          option -stale-warn
 max-start-age = 2h                   # on restart, serve the saved VRPs at once if newer (restart)   option -max-start-age
 
 
@@ -42,6 +43,10 @@ auth    =                            # TCP-MD5 / TCP-AO key file. empty = plain 
 refresh = 600                        # refresh interval sent to routers (seconds, 1..86400)          option -rtr-refresh
 retry   = 300                        # retry interval (seconds, 1..7200)                             option -rtr-retry
 expire  = 7200                       # expire interval (seconds, 600..172800)                        option -rtr-expire
+max-conns  = 256                     # concurrent RTR connections (0 = no limit)                     option -rtr-max-conns
+max-per-ip = 4                       # concurrent connections per address (IPv6 per /64)             option -rtr-max-per-ip
+stale-close = 0                      # close RTR when the set is older (0 = off, else >= 30m)        option -stale-close
+                                     #   routers then fail over to another RP
 
 
 [rtr-tls]
@@ -54,8 +59,11 @@ ca     =                             # CA for router certificates. if set, route
 [http]
 listen = 127.0.0.1:8323,             # API addresses (default 127.0.0.1:8323) (restart)             option -http
          0.0.0.0:8324                #   example second address for other hosts
-allow  = 127.0.0.1, ::1,             # allowed client addresses, applies to every listen, else 403   option -http-allow
+allow  = 127.0.0.1, ::1,             # internal clients : every path. applies to every listen         option -http-allow
          198.51.100.0/24             #   example management network
+public =                             # public clients : lookup paths only, status without internal    option -http-public
+                                     #   data, /json and /csv once per delta-full-interval per client
+                                     #   e.g. 0.0.0.0/0, ::/0. neither list = 403, both = allow wins
 jsonext             = false          # open /jsonext (large, about 5 s / 470 MB per call)            option -jsonext
 delta-full-interval = 1m             # full /json-delta at most once per client in this interval     option -delta-full-interval
                                      #   0 = no limit

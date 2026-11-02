@@ -46,6 +46,10 @@ var confFields = []confField{
 	{"validation.drop-warn", false, func(c *daemonConfig) string { return str(c.DropWarn) }},
 	{"validation.hold-drop", false, func(c *daemonConfig) string { return str(c.HoldOnDrop) }},
 	{"validation.max-start-age", true, func(c *daemonConfig) string { return str(c.MaxStartAge) }},
+	{"validation.stale-warn", false, func(c *daemonConfig) string { return str(c.StaleWarn) }},
+	{"rtr.max-conns", false, func(c *daemonConfig) string { return str(c.RTRMaxConns) }},
+	{"rtr.max-per-ip", false, func(c *daemonConfig) string { return str(c.RTRMaxPerIP) }},
+	{"rtr.stale-close", false, func(c *daemonConfig) string { return str(c.StaleClose) }},
 	{"rtr.listen", true, func(c *daemonConfig) string { return c.RTRAddr }},
 	{"rtr.allow", false, func(c *daemonConfig) string { return strings.Join(c.RTRAllow, ",") }},
 	{"rtr.auth", true, func(c *daemonConfig) string { return c.RTRAuth }},
@@ -58,6 +62,7 @@ var confFields = []confField{
 	{"rtr-tls.ca", false, func(c *daemonConfig) string { return c.RTRTLSCA }},
 	{"http.listen", true, func(c *daemonConfig) string { return c.HTTPAddr }},
 	{"http.allow", false, func(c *daemonConfig) string { return strings.Join(c.HTTPAllow, ",") }},
+	{"http.public", false, func(c *daemonConfig) string { return strings.Join(c.HTTPPublic, ",") }},
 	{"http.jsonext", false, func(c *daemonConfig) string { return str(c.JSONExt) }},
 	{"http.delta-full-interval", false, func(c *daemonConfig) string { return str(c.DeltaFullInterval) }},
 }
@@ -123,13 +128,17 @@ func (d *daemon) reload() error {
 	if err != nil {
 		return reloadFail(fmt.Errorf("http.allow %v", err))
 	}
+	httpPub, err := parsePrefixes(nc.HTTPPublic)
+	if err != nil {
+		return reloadFail(fmt.Errorf("http.public %v", err))
+	}
 	var newTLS *tls.Config // TLS 포트가 열려 있고 인증서가 바뀌었을 때만 새로 읽음
 	if d.rtrTLS != nil && (nc.RTRTLSCert != old.RTRTLSCert || nc.RTRTLSKey != old.RTRTLSKey || nc.RTRTLSCA != old.RTRTLSCA) {
 		if newTLS, err = rtrTLSConfig(nc.RTRTLSCert, nc.RTRTLSKey, nc.RTRTLSCA); err != nil {
 			return reloadFail(fmt.Errorf("rtr-tls %v", err))
 		}
 	}
-	d.applyReload(&nc, old, path, rtrAllow, httpAllow, newTLS)
+	d.applyReload(&nc, old, path, rtrAllow, httpAllow, httpPub, newTLS)
 	return nil
 }
 
@@ -139,7 +148,7 @@ func reloadFail(err error) error {
 }
 
 // applyReload : 확인이 끝난 새 설정을 적용하고 로그를 남김
-func (d *daemon) applyReload(nc, old *daemonConfig, path string, rtrAllow, httpAllow []netip.Prefix, newTLS *tls.Config) {
+func (d *daemon) applyReload(nc, old *daemonConfig, path string, rtrAllow, httpAllow, httpPub []netip.Prefix, newTLS *tls.Config) {
 	var changed, restart []string
 	for _, f := range confFields {
 		a, b := f.get(old), f.get(nc)
@@ -157,12 +166,13 @@ func (d *daemon) applyReload(nc, old *daemonConfig, path string, rtrAllow, httpA
 
 	d.live.Store(nc)
 	d.httpAllow.Store(&httpAllow)
+	d.httpPub.Store(&httpPub)
 	if newTLS != nil {
 		d.rtrTLSCur.Store(newTLS)
 	}
 	dropped := 0
 	if d.rtr != nil {
-		dropped = d.rtr.setLive(rtrAllow, nc.RTRRefresh, nc.RTRRetry, nc.RTRExpire)
+		dropped = d.rtr.setLive(rtrAllow, nc.RTRRefresh, nc.RTRRetry, nc.RTRExpire, nc.RTRMaxConns, nc.RTRMaxPerIP)
 	}
 	d.mu.Lock()
 	d.confPath, d.confAt = path, time.Now()
