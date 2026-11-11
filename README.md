@@ -94,7 +94,7 @@ For a systemd installation see `deploy/haetae.service`,
 - [API guide](docs/api.md) : HTTP API and RTR
 - [Trust anchors](tals/README.md)
 - [Changes](CHANGELOG.md)
-- Introduction slides : [English](docs/haetae_v0.2_en.pdf), [Korean](docs/haetae_v0.2_ko.pdf)
+- Introduction slides : [English](docs/haetae_v0.3_en.pdf), [Korean](docs/haetae_v0.3_ko.pdf)
 
 Source code comments, command line help and some log messages are in Korean.
 
