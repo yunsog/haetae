@@ -78,6 +78,9 @@ func TestConfigErrors(t *testing.T) {
 		"bool 아님":     "[fetch]\nrsync = yes please\n",
 		"구역 이름 깨짐":    "[rtr\nretry = 1\n",
 		"duration 아님": "[fetch]\ninterval = 10\n",
+		"따옴표 안 닫힘":    "[paths]\nslurm = \"/etc/a.json\n",
+		"따옴표 가운데":     "[paths]\nslurm = /etc/\"a\".json\n",
+		"따옴표 뒤 글자":    "[paths]\nslurm = \"/etc/a\".json\n",
 	}
 	for name, text := range bad {
 		f := flag.NewFlagSet("t", flag.ContinueOnError)
@@ -122,6 +125,37 @@ func TestHTTPAllow(t *testing.T) {
 		h.ServeHTTP(rec, req)
 		if rec.Code != want {
 			t.Errorf("%s : %d, want %d", addr, rec.Code, want)
+		}
+	}
+}
+
+// 따옴표 : 안의 # / 쉼표는 글자, 감싼 따옴표는 뗌, 따옴표 밖 # 은 주석 (11-04)
+func TestConfigQuotes(t *testing.T) {
+	text := `[paths]
+slurm = "/etc/haetae/slurm#2.json"   # 주석
+tal   = /etc/haetae/tals              # 따옴표 없음 그대로
+[rtr]
+allow = "127.0.0.1", ::1,
+        "192.0.2.0/24"
+[rtr-tls]
+cert  = ""
+`
+	e, err := parseConf(strings.NewReader(text))
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := map[string]string{
+		"paths.slurm":  "/etc/haetae/slurm#2.json",
+		"paths.tal":    "/etc/haetae/tals",
+		"rtr.allow":    "127.0.0.1,::1,192.0.2.0/24",
+		"rtr-tls.cert": "",
+	}
+	if len(e) != len(want) {
+		t.Fatalf("entries %v", e)
+	}
+	for _, x := range e {
+		if want[x.Key] != x.Val {
+			t.Errorf("%s = %q, want %q", x.Key, x.Val, want[x.Key])
 		}
 	}
 }

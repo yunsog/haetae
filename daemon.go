@@ -2,7 +2,7 @@ package main
 
 // daemon.go : 상주 모드 (4 단계)
 //
-//   시작 : 잠금 (같은 것 두 개 방지) -> session / serial (state.json) -> 직전 VRP (출력 json) 가
+//   시작 : 잠금 (같은 것 두 개 방지) -> 직전 집합 + session / serial (state/payload.gob) 이
 //          MaxStartAge 안이면 그것으로 RTR 바로 시작 (C3, B5) -> HTTP API
 //   반복 : Interval (B2 = 10 분) 마다 수집 + 검증 -> 이상 없으면 새 집합으로 (serial + 1, RTR Notify)
 //          -> 출력 파일 (json / csv / objects.jsonl / rejects / repos) -> 한 줄 요약 로그 (D5)
@@ -21,6 +21,7 @@ import (
 	"net/netip"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -37,6 +38,7 @@ type daemonConfig struct {
 	Interval          time.Duration
 	Workers           int
 	FetchJobs         int
+	FetchDeadline     time.Duration // 회차의 수집 기한 (0 = 없음, 11-05)
 	NoRsync           bool
 	RTRAddr           string
 	RTRAllow          []string
@@ -44,9 +46,11 @@ type daemonConfig struct {
 	RTRRefresh        uint32 // C5 : End of Data 에 실어 보내는 타이머 (초, v1 / v2)
 	RTRRetry          uint32
 	RTRExpire         uint32
-	RTRMaxConns       int    // RTR 동시 연결 상한 (0 = 없음)
-	RTRMaxPerIP       int    // 주소 하나 (IPv6 /64) 의 RTR 동시 연결 상한 (0 = 없음)
-	RTRTLSAddr        string // RTR over TLS 주소 (빈 값 = 안 엶)
+	RTRMaxConns       int      // RTR 동시 연결 상한 (0 = 없음)
+	RTRMaxPerIP       int      // 주소 하나 (IPv6 /64) 의 RTR 동시 연결 상한 (0 = 없음)
+	RTRTrusted        []string // 운영 라우터 대역 (11-05) : 늘 허용, 상한은 RTRTrustedMax 만
+	RTRTrustedMax     int      // trusted 대역의 RTR 동시 연결 상한 (0 = 없음)
+	RTRTLSAddr        string   // RTR over TLS 주소 (빈 값 = 안 엶)
 	RTRTLSCert        string
 	RTRTLSKey         string
 	RTRTLSCA          string // 있으면 라우터 인증서 필수
@@ -131,8 +135,9 @@ type daemon struct {
 
 	notApplied map[string]int // 반영 안 한 회차 수, 이유별 (/metrics haetae_runs_not_applied_total, d.mu)
 
-	fullMu   sync.Mutex
-	fullLast map[string]time.Time // 큰 응답 (/json-delta 전체, 공개 쪽 /json /csv) 을 준 시각 (종류 + 받는 쪽 주소별)
+	fullMu    sync.Mutex
+	fullLast  map[string]time.Time // 종류 + 받는 쪽 주소 -> 다시 받아도 되는 시각 (/json-delta 전체, 공개 쪽 /json /csv /api/v1/as)
+	fullSweep time.Time            // fullLast 를 마지막으로 정리한 때
 
 	// reload 로 바뀌는 값 (reload.go). 읽는 쪽은 d.c() 로 지금 묶음을 꺼내 씀 (C 의 포인터 교체와 같음)
 	live      atomic.Pointer[daemonConfig]
@@ -163,6 +168,19 @@ func (d *daemon) c() *daemonConfig {
 	return &d.cfg
 }
 
+// privateState : 잠금 파일 0600, 상태 폴더 0750 (11-05 검토 14). 처음 만든 판이 0644 / 0755 였으므로 시작 때마다 고침.
+// 리눅스 flock 은 읽기로 연 파일에도 걸려, 남이 읽을 수 있으면 다른 계정이 잠금을 쥐어 다음 재시작을 막을 수 있음.
+// 출력 (out) / 캐시 (cache) 는 공개 데이터라 그대로 (다른 도구가 out/json 을 직접 읽을 수 있음).
+// 주인이 아니면 (개발 때 다른 계정의 폴더) 바꾸지 못해도 경고만
+func privateState(lf *os.File, stateDir string) {
+	if err := lf.Chmod(0600); err != nil {
+		log.Printf("WARNING lock %s: chmod 0600: %v", lf.Name(), err)
+	}
+	if err := os.Chmod(stateDir, 0750); err != nil {
+		log.Printf("WARNING state %s: chmod 0750: %v", stateDir, err)
+	}
+}
+
 // runDaemon : 상주. resume = 판 올리기로 옛 프로세스가 넘긴 상태 파일 (handover.go, 없으면 "")
 func runDaemon(cfg daemonConfig, once bool, resume string) int {
 	for _, d := range []string{cfg.CacheDir, cfg.OutDir, cfg.StateDir} {
@@ -187,7 +205,7 @@ func runDaemon(cfg daemonConfig, once bool, resume string) int {
 		lf = hs.lockFile(filepath.Join(cfg.StateDir, "lock"))
 	} else {
 		var err error
-		if lf, err = os.OpenFile(filepath.Join(cfg.StateDir, "lock"), os.O_CREATE|os.O_RDWR, 0644); err != nil {
+		if lf, err = os.OpenFile(filepath.Join(cfg.StateDir, "lock"), os.O_CREATE|os.O_RDWR, 0600); err != nil {
 			log.Print(err)
 			return 1
 		}
@@ -196,6 +214,7 @@ func runDaemon(cfg daemonConfig, once bool, resume string) int {
 			return 1
 		}
 	}
+	privateState(lf, cfg.StateDir)
 	// TAL : 시작 때 한 번 확인하고 어느 것을 쓰는지 기록 (깨졌으면 시작하지 않음). 회차마다 다시 읽음
 	tals, source, err := loadTALs(cfg.TALDir)
 	if err != nil {
@@ -226,7 +245,7 @@ func runDaemon(cfg daemonConfig, once bool, resume string) int {
 	}
 
 	d.rtr = &rtrServer{St: d.st, Refresh: cfg.RTRRefresh, Retry: cfg.RTRRetry, Expire: cfg.RTRExpire,
-		MaxConns: cfg.RTRMaxConns, MaxPerIP: cfg.RTRMaxPerIP, Logf: log.Printf}
+		MaxConns: cfg.RTRMaxConns, MaxPerIP: cfg.RTRMaxPerIP, TrustedMax: cfg.RTRTrustedMax, Logf: log.Printf}
 	for _, a := range cfg.RTRAllow {
 		p, err := parsePrefixOrAddr(a)
 		if err != nil {
@@ -235,6 +254,12 @@ func runDaemon(cfg daemonConfig, once bool, resume string) int {
 		}
 		d.rtr.Allow = append(d.rtr.Allow, p)
 	}
+	trusted, err := parsePrefixes(cfg.RTRTrusted)
+	if err != nil {
+		log.Printf("rtr trusted %v", err)
+		return 1
+	}
+	d.rtr.Trusted = trusted
 	if cfg.RTRAuth != "" {
 		keys, err := loadRTRAuth(cfg.RTRAuth, log.Printf)
 		if err != nil {
@@ -336,10 +361,13 @@ func (d *daemon) httpConnState(c net.Conn, st http.ConnState) {
 	d.httpBusyMu.Unlock()
 }
 
+// httpTrusted : 내부 허용 목록 (-http-allow) 주소 = 연결 상한의 공개 쪽 제한을 받지 않음 (reload 로 바뀐 목록을 바로 씀)
+func (d *daemon) httpTrusted(ip netip.Addr) bool { return prefixesContain(d.httpAllow.Load(), ip) }
+
 // serveHTTP : 듣기 소켓 하나에 HTTP 서버 (시작 / 판 올리기를 그만둘 때)
 func (d *daemon) serveHTTP(addr string, ln net.Listener) {
-	// 시간 제한 : 요청 머리 10 초, 요청 전체 30 초, 쉬는 연결 2 분. 응답 쓰기는 제한 없음 (큰 파일, 느린 망)
-	srv := &http.Server{Handler: d.httpHandler, ReadHeaderTimeout: 10 * time.Second, ReadTimeout: 30 * time.Second,
+	// 시간 제한 : 요청 머리 10 초, 요청 전체 30 초, 쉬는 연결 2 분. 응답 쓰기는 전체 제한 없이 조각마다 60 초 (writeProgress)
+	srv := &http.Server{Handler: writeProgress(d.httpHandler), ReadHeaderTimeout: 10 * time.Second, ReadTimeout: 30 * time.Second,
 		IdleTimeout: 2 * time.Minute, MaxHeaderBytes: 64 << 10, ConnState: d.httpConnState}
 	d.mu.Lock()
 	d.httpSrv = append(d.httpSrv, srv)
@@ -347,7 +375,7 @@ func (d *daemon) serveHTTP(addr string, ln net.Listener) {
 	d.mu.Unlock()
 	go func() {
 		log.Printf("http listening %s", addr)
-		if err := srv.Serve(newLimitListener(ln, maxHTTPConns, &d.httpHold)); err != http.ErrServerClosed {
+		if err := srv.Serve(newLimitListener(ln, maxHTTPConns, &d.httpHold, d.httpTrusted)); err != http.ErrServerClosed {
 			log.Print(err)
 		}
 	}()
@@ -357,14 +385,10 @@ func (d *daemon) serveHTTP(addr string, ln net.Listener) {
 //
 //	state/payload.gob (0.2.0) = RTR 에 준 집합 (SLURM 뒤) + session / serial + delta 기록, 한 파일이라 언제나 같은 회차
 //	집합이 max-start-age 보다 오래되었거나 파일이 깨졌으면 새 session : 라우터가 전체를 새로 받음 (같은 serial 에 다른 내용 금지)
-//	payload.gob 이 아예 없으면 (0.2.0 전 판에서 올라온 첫 시작) 옛 방식 (state.json + out/json + deltas.gob) 한 번
+//	payload.gob 이 없으면 (처음 시작, 0.2.0 전 판) 도 새 session (0.3.0 에서 옛 방식 읽기를 지움)
 func (d *daemon) loadState() {
 	gp := filepath.Join(d.cfg.StateDir, "payload.gob")
 	ss, p, err := loadSavedState(gp)
-	if os.IsNotExist(err) {
-		d.loadStateLegacy()
-		return
-	}
 	if err == nil && time.Since(p.Built) > d.cfg.MaxStartAge {
 		err = fmt.Errorf("too old (%s)", time.Since(p.Built).Round(time.Second))
 	}
@@ -392,34 +416,6 @@ func newSession(old uint16) uint16 {
 	return binary.BigEndian.Uint16(b[:]) ^ old
 }
 
-// loadStateLegacy : 0.2.0 전 저장 방식 (state.json + 직전 json + deltas.gob). payload.gob 이 생기면 다시 쓰지 않음 (다음 판에서 지움)
-func (d *daemon) loadStateLegacy() {
-	sp := filepath.Join(d.cfg.StateDir, "state.json")
-	st, err := loadRTRState(sp)
-	if err == nil {
-		d.st.Session, d.st.Serial = st.Session, st.Serial
-		log.Printf("state (legacy): session %d serial %d (saved %s)", st.Session, st.Serial, st.Saved.Format(time.RFC3339))
-	}
-	jp := filepath.Join(d.cfg.OutDir, "json")
-	p, perr := loadPayloadJSON(jp)
-	if perr == nil && time.Since(p.Built) > d.cfg.MaxStartAge {
-		perr = fmt.Errorf("too old (%s)", time.Since(p.Built).Round(time.Second))
-	}
-	if err != nil || perr != nil {
-		d.st.Session = newSession(d.st.Session)
-		log.Printf("state: new session %d (previous VRP: %v)", d.st.Session, perr)
-		return
-	}
-	if hist, err := loadDeltas(filepath.Join(d.cfg.StateDir, "deltas.gob"), d.st.Session, d.st.Serial); err == nil {
-		d.st.History = hist
-		log.Printf("deltas loaded: %d", len(hist))
-	} else {
-		log.Printf("deltas: %v (start empty)", err)
-	}
-	d.st.update(p)
-	log.Printf("previous VRP loaded: %d VRPs from %s", len(p.VRPs), p.Built.Format(time.RFC3339))
-}
-
 func (d *daemon) openRTR() {
 	d.mu.Lock()
 	defer d.mu.Unlock()
@@ -434,7 +430,7 @@ func (d *daemon) openRTR() {
 			log.Printf("rtr listen %s: %v (retry after next applied run)", d.cfg.RTRAddr, err)
 		} else {
 			d.rtrListen = ln
-			log.Printf("rtr listening %s (allow %v, tcp auth keys %d)", d.cfg.RTRAddr, d.cfg.RTRAllow, len(d.rtr.Auth))
+			log.Printf("rtr listening %s (allow %v, trusted %v, tcp auth keys %d)", d.cfg.RTRAddr, d.cfg.RTRAllow, d.cfg.RTRTrusted, len(d.rtr.Auth))
 			go d.rtr.serve(ln)
 		}
 	}
@@ -495,25 +491,37 @@ func (d *daemon) cycle() {
 	d.slurmErr = ""
 	d.mu.Unlock()
 
+	d.fetch.RunDeadline = c.FetchDeadline // reset 이 이 값으로 이번 회차 기한을 정함
 	d.fetch.reset()
 	d.fetch.NoRsync = c.NoRsync
 	if cap(d.fetch.sem) != c.FetchJobs { // 회차 사이라 수집 중인 것 없음
 		d.fetch.sem = make(chan struct{}, c.FetchJobs)
 	}
+	d.fetch.checkDisk()
 	v := newValidator(d.cfg.CacheDir, time.Now(), c.Workers)
 	v.Fetch = d.fetch
 	v.ValidDir = filepath.Join(d.cfg.CacheDir, "valid") // 직전 정상 publication point (valid.go)
 	v.run(tals)
+	if n := d.fetch.late.Load(); n > 0 {
+		log.Printf("WARNING run deadline %s: %d repositories not fetched (using previous data)", c.FetchDeadline, n)
+	}
 	if len(v.failedTA) == 0 {
-		// 이번에 보지 않은 CA 의 저장본 정리 (TA 가 하나라도 실패하면 못 본 CA 가 많으니 건너뜀)
+		// 이번에 보지 않은 CA 의 저장본 / 오래 안 쓴 저장소 폴더 정리 (TA 가 하나라도 실패하면 못 본 CA 가 많으니 건너뜀)
 		if n := cleanValid(v.ValidDir, v.validSeen); n > 0 {
 			log.Printf("valid: removed %d stale publication points", n)
+		}
+		if n := d.fetch.cleanRepos(); n > 0 {
+			log.Printf("cache: removed %d repositories unused for %s", n, repoKeepUnused)
 		}
 	}
 	ps := newPayloadSet(v, slurm)
 
 	ri.VRPs, ri.VAPs, ri.Keys = len(ps.VRPs), len(ps.ASPAs), len(ps.Keys)
 	ri.FailedTA, ri.Counts = v.failedTA, v.count
+	// TA 키 교체 예고 (TAK successor) : 놓치면 교체 뒤 그 RIR 전체가 빠지므로 회차마다 로그
+	for _, ex := range v.warnEx[warnTAKSuccessor] {
+		log.Printf("WARNING TA key rollover announced (TAK, update TAL): %s", ex)
+	}
 	ri.PerTA = map[string]int{}
 	for _, k := range ps.Full {
 		ri.PerTA[k.TA]++
@@ -567,10 +575,8 @@ func (d *daemon) cycle() {
 		// 재시작 복원용 : 집합 + session / serial + delta 를 한 파일에 (반영할 때마다, 집합의 시각이 max-start-age 판단에 쓰임)
 		if err := saveState(filepath.Join(d.cfg.StateDir, "payload.gob"), d.st); err != nil {
 			log.Printf("state save: %v", err)
-		} else {
-			os.Remove(filepath.Join(d.cfg.StateDir, "deltas.gob")) // 옛 방식 파일 (payload.gob 이 대신함)
 		}
-		// state.json : 사람이 보는 용도 (session / serial). 복원에는 payload.gob 이 없을 때만 씀
+		// state.json : 사람이 보는 용도 (session / serial). 복원에는 쓰지 않음
 		if err := saveRTRState(filepath.Join(d.cfg.StateDir, "state.json"), d.st); err != nil {
 			log.Printf("state.json save: %v", err)
 		}
@@ -600,6 +606,30 @@ func (d *daemon) cycle() {
 	// 한 줄 요약 (D5)
 	log.Printf("run %s: vrps %d vaps %d keys %d +%d -%d serial %d repos %v %dMB applied=%v %s",
 		ri.Duration, ri.VRPs, ri.VAPs, ri.Keys, ri.Announced, ri.Withdrawn, ser, ri.Repos, ri.MB, apply, ri.Reason)
+	// 오래 걸린 회차 : 어느 저장소가 느렸는지 남김 (11-03 10 분 회차의 원인을 못 찾음, 11-04)
+	if time.Since(ri.Start) >= slowRun {
+		log.Printf("slow run %s: slowest repos %s", ri.Duration, slowestRepos(repos, 5))
+	}
+}
+
+// slowRun : 평소 회차는 1 분 안팎, 이보다 길면 느린 저장소를 로그에
+const slowRun = 3 * time.Minute
+
+// slowestRepos : 받는 데 오래 걸린 저장소 n 개 "uri type result 시간" (긴 순)
+func slowestRepos(repos []repoStatus, n int) string {
+	rs := append([]repoStatus(nil), repos...)
+	sort.Slice(rs, func(i, j int) bool { return rs[i].Duration > rs[j].Duration })
+	var parts []string
+	for _, r := range rs {
+		if len(parts) == n || r.Duration < time.Second {
+			break
+		}
+		parts = append(parts, fmt.Sprintf("%s %s %s %s", r.URI, r.Type, r.Result, r.Duration.Round(time.Second)))
+	}
+	if len(parts) == 0 {
+		return "(none over 1s, time spent in validation)"
+	}
+	return strings.Join(parts, ", ")
 }
 
 // buildView : 받지 않고 캐시만 검증해 조회 API 결과 (objects / ca / expiring / unsafe, VRP 출처) 를 만듦.

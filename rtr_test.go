@@ -4,10 +4,12 @@ package main
 
 import (
 	"encoding/binary"
+	"fmt"
 	"io"
 	"log"
 	"net"
 	"net/netip"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -230,5 +232,158 @@ func TestRTRLimits(t *testing.T) {
 	c3.Write(query(1, pduResetQuery, 0, nil))
 	if n := readUntilEOD(t, c3); n[pduEndOfData] != 1 {
 		t.Errorf("after release: %v", n)
+	}
+}
+
+// delta 와 RTR 전체는 정렬된 순서 (map 순서가 아님, 11-04)
+func TestDeltaSorted(t *testing.T) {
+	var a, b []rtrVRP
+	for i := 0; i < 500; i++ {
+		a = append(a, vr(fmt.Sprintf("10.%d.%d.0/24", i/256, i%256), 24, uint32(65000+i%7)))
+		b = append(b, vr(fmt.Sprintf("172.16.%d.0/24", i%256), 24, uint32(64500+i)))
+	}
+	st := &store{Session: 1}
+	st.update(mkSet(a, nil))       // 첫 집합 (serial 0)
+	st.update(mkSet(b, nil))       // serial 1 : a 전부 withdraw, b 전부 announce
+	st.update(mkSet(b[:250], nil)) // serial 2 : b 반 withdraw
+	sorted := func(vs []rtrVRP) bool {
+		c := append([]rtrVRP(nil), vs...)
+		sortRTRVRPs(c)
+		for i := range c {
+			if c[i] != vs[i] {
+				return false
+			}
+		}
+		return true
+	}
+	for i := 0; i < 3; i++ { // map 순서는 부를 때마다 바뀌므로 여러 번
+		ann, wdr, _, _, _, ok := st.netDiff(0)
+		if !ok || len(ann) != 250 || len(wdr) != 500 || !sorted(ann) || !sorted(wdr) {
+			t.Fatalf("0->2: ok %v ann %d wdr %d", ok, len(ann), len(wdr))
+		}
+		ann, wdr, _, _, _, _ = st.netDiffTo(0, 1)
+		if len(ann) != 500 || len(wdr) != 500 || !sorted(ann) || !sorted(wdr) {
+			t.Fatalf("0->1: ann %d wdr %d", len(ann), len(wdr))
+		}
+	}
+}
+
+// trusted 와 공개의 자리 셈 (11-05 검토 8) : trusted 는 같은 /64 에 많아도 주소당 상한 없음 + 공개 쪽 상한과 따로,
+// 공개 쪽은 /64 마다 MaxPerIP, /48 마다 rtrMaxPer48, 공개 합 MaxConns
+func TestRTRTrustedSlots(t *testing.T) {
+	srv := &rtrServer{Logf: t.Logf, MaxConns: 2, MaxPerIP: 1, TrustedMax: 10,
+		Trusted: []netip.Prefix{netip.MustParsePrefix("2001:db8:1::/64"), netip.MustParsePrefix("192.0.2.9/32")}}
+	var held []rtrSlot
+	take := func(remote string, want bool) {
+		t.Helper()
+		sl, ok := srv.take(remote)
+		if ok != want {
+			t.Fatalf("take %s = %v, want %v", remote, ok, want)
+		}
+		if ok {
+			held = append(held, sl)
+		}
+	}
+	// 공개 : 같은 /64 두 번째 거절, 공개 합 2 개에서 거절
+	take("[2001:db9:0:1::1]:1", true)
+	take("[2001:db9:0:1::2]:1", false)
+	take("198.51.100.1:1", true)
+	take("198.51.100.2:1", false)
+	// trusted : 공개 쪽이 차 있어도, 같은 /64 의 /128 이 여럿이어도 됨. TrustedMax 에서 거절
+	for i := 1; i <= 9; i++ {
+		take(fmt.Sprintf("[2001:db8:1::%x]:179", i), true)
+	}
+	take("[::ffff:192.0.2.9]:1", true) // IPv4-mapped 도 trusted
+	take("[2001:db8:1::ff]:1", false)
+	if !held[len(held)-1].trusted || held[0].trusted {
+		t.Error("trusted flag")
+	}
+	// 전체 전송 열쇠 : 공개는 /64, trusted 는 세지 않음
+	if held[2].fullKey != "" || held[0].fullKey != "2001:db9:0:1::/64" {
+		t.Errorf("full keys %q %q", held[2].fullKey, held[0].fullKey)
+	}
+	// 돌려주면 다시 됨
+	for _, sl := range held {
+		srv.release(sl)
+	}
+	if srv.total != 0 || srv.trusted != 0 || len(srv.perIP) != 0 || len(srv.per48) != 0 {
+		t.Errorf("after release: total %d trusted %d perIP %v per48 %v", srv.total, srv.trusted, srv.perIP, srv.per48)
+	}
+	// 공개 IPv6 /48 : /64 를 바꿔 가며 rtrMaxPer48 개까지
+	srv.MaxConns = 1000
+	for i := 0; i < rtrMaxPer48; i++ {
+		take(fmt.Sprintf("[2001:db9:0:%x::1]:1", i), true)
+	}
+	take("[2001:db9:0:ffff::1]:1", false)
+	take("[2001:db9:1:1::1]:1", true) // 다른 /48
+}
+
+// 주소마다 1 분에 rtrFullPerClient 번 (11-05 검토 7 : 다시 붙어서 연결마다 제한을 피함)
+func TestRTRFullPerClient(t *testing.T) {
+	srv := &rtrServer{Logf: t.Logf}
+	for i := 0; i < rtrFullPerClient; i++ {
+		if !srv.allowFull("a") {
+			t.Fatalf("full %d refused", i+1)
+		}
+	}
+	if srv.allowFull("a") {
+		t.Error("over per-client limit allowed")
+	}
+	if !srv.allowFull("b") {
+		t.Error("other client refused")
+	}
+	srv.fullAt["a"] = []time.Time{time.Now().Add(-2 * rtrFullEvery), time.Now().Add(-2 * rtrFullEvery)}
+	if !srv.allowFull("a") {
+		t.Error("old entries still counted")
+	}
+}
+
+// 판 올리기 때 응답을 읽지 않는 연결은 쓰기 기한으로 끊기고, 나머지는 멈춤 (11-05 검토 9 : 전에는 5 분 기다리다 판 올리기 실패)
+func TestRTRPauseCutsNonReader(t *testing.T) {
+	old := rtrPauseWrite
+	rtrPauseWrite = 500 * time.Millisecond
+	defer func() { rtrPauseWrite = old }()
+	var vs []rtrVRP
+	for i := 0; i < 600000; i++ { // 약 12 MB : 서버 보내기 버퍼 (최대 약 4 MB) 보다 큼
+		vs = append(vs, vr(fmt.Sprintf("%d.%d.%d.0/24", 10+i/65536, (i/256)%256, i%256), 24, uint32(64512+i%1000)))
+	}
+	st := &store{Session: 5}
+	st.update(mkSet(vs, nil))
+	srv := &rtrServer{St: st, Refresh: 600, Retry: 300, Expire: 7200, Logf: t.Logf,
+		Allow: []netip.Prefix{netip.MustParsePrefix("127.0.0.0/8")}}
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	go srv.serve(ln)
+
+	idle, err := net.Dial("tcp", ln.Addr().String()) // 정상 : 전체를 받고 쉼
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer idle.Close()
+	idle.Write(query(1, pduResetQuery, 0, nil))
+	readUntilEOD(t, idle)
+	// Reset 을 보내고 읽지 않음. 받는 버퍼는 연결 전에 작게 (붙은 뒤에 줄이면 창이 이미 커져 있음)
+	dl := net.Dialer{Control: func(_, _ string, rc syscall.RawConn) error {
+		return rc.Control(func(fd uintptr) { syscall.SetsockoptInt(int(fd), syscall.SOL_SOCKET, syscall.SO_RCVBUF, 4096) })
+	}}
+	bad, err := dl.Dial("tcp", ln.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer bad.Close()
+	bad.Write(query(1, pduResetQuery, 0, nil))
+	time.Sleep(300 * time.Millisecond) // 서버가 쓰기에서 막힘
+
+	srv.pauseAll()
+	defer srv.resumeAll()
+	parked, err := srv.waitParked(5 * time.Second)
+	if err != nil {
+		t.Fatalf("waitParked: %v", err)
+	}
+	if len(parked) != 1 {
+		t.Errorf("parked %d, want 1 (idle only)", len(parked))
 	}
 }

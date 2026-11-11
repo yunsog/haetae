@@ -112,6 +112,9 @@ type fetcher struct {
 	NoRsync            bool
 	Offline            bool // 받지 않고 캐시에서만 고름 (판 올리기 직후 조회 결과 다시 만들기, daemon.go buildView)
 	Logf               func(string, ...any)
+	// 회차 기한 (fetch.deadline, 0 = 없음, 11-05) : reset 때부터 이만큼 지나면 남은 저장소는 받지 않고 직전 데이터로 (repo_guard.go)
+	RunDeadline time.Duration
+	LowDisk     bool // 디스크가 모자람 (checkDisk) : 새 저장소는 받지 않음
 
 	client *http.Client
 	tmpDir string
@@ -124,6 +127,9 @@ type fetcher struct {
 
 	bytes  atomic.Int64
 	rsyncs atomic.Int64
+
+	deadline time.Time    // 이번 회차의 수집 기한 (reset 이 정함, 0 = 없음)
+	late     atomic.Int64 // 기한이 지나 받지 않은 저장소 수
 }
 
 func newFetcher(cacheDir string, concurrency int) (*fetcher, error) {
@@ -157,9 +163,14 @@ func (f *fetcher) reset() {
 	f.mu.Lock()
 	f.repos = map[string]*repoFetch{}
 	f.status = nil
+	f.deadline = time.Time{}
+	if f.RunDeadline > 0 {
+		f.deadline = time.Now().Add(f.RunDeadline)
+	}
 	f.mu.Unlock()
 	f.bytes.Store(0)
 	f.rsyncs.Store(0)
+	f.late.Store(0)
 }
 
 func (f *fetcher) logf(format string, a ...any) {
@@ -278,8 +289,17 @@ func (f *fetcher) ensure(c *rpkiCert) string {
 		return base
 	}
 	base, ok := f.ensureRRDP(c.Notify)
-	if ok || f.NoRsync {
+	if ok {
 		return base
+	}
+	if f.NoRsync {
+		// rsync 끔 : 예전에 받은 RRDP 데이터가 있으면 그것 (A2). 없으면 "" = 그 CA 실패 (spawn).
+		// 전에는 "" 로 돌아가 uriPath 가 프로세스 현재 폴더 기준 상대 경로를 읽었음 (11-05 검토 낮음)
+		dir, statePath := rrdpPaths(f.CacheDir, c.Notify)
+		if _, err := loadRRDPState(statePath); err == nil {
+			return dir
+		}
+		return ""
 	}
 	rbase, rok := f.ensureRsync(c.CARepository)
 	f.rsyncOutcome(c.Notify, rsyncModule(c.CARepository), rok)
@@ -354,16 +374,28 @@ func (f *fetcher) ensureRRDP(notify string) (string, bool) {
 		var res rrdpResult
 		var err error
 		skip, h := f.skipUntil(key)
-		if skip.IsZero() {
-			ctx, cancel := context.WithTimeout(context.Background(), f.Timeout)
+		_, statePath := rrdpPaths(f.CacheDir, notify)
+		_, serr := os.Stat(statePath)
+		// held = 이 저장소 탓이 아닌 이유로 받지 않음 (회차 기한, 새 저장소인데 디스크 부족) : 연속 실패로 세지 않음
+		held := skip.IsZero() && (f.pastDeadline() || (f.LowDisk && serr != nil))
+		switch {
+		case held:
+			dir, _ = rrdpPaths(f.CacheDir, notify)
+			err = errLowDisk
+			if f.pastDeadline() {
+				err = errRunDeadline
+				f.late.Add(1)
+			}
+		case skip.IsZero():
+			ctx, cancel := context.WithTimeout(context.Background(), f.fetchTimeout())
 			dir, res, err = f.syncRRDP(ctx, notify)
 			cancel()
-		} else {
+		default:
 			dir, _ = rrdpPaths(f.CacheDir, notify)
 			err = fmt.Errorf("skipped after %d failures until %s (last: %s)", h.failures, skip.Format(time.RFC3339), h.lastErr)
 		}
 		st := repoStatus{URI: notify, Type: "rrdp", Action: res.Action, Serial: res.Serial, Files: res.Files, Start: start, Duration: time.Since(start)}
-		if skip.IsZero() {
+		if skip.IsZero() && !held {
 			f.repoDone(key, &st, err)
 		} else {
 			st.Skipped = true
@@ -375,8 +407,7 @@ func (f *fetcher) ensureRRDP(notify string) (string, bool) {
 			return dir
 		}
 		st.Error = err.Error()
-		_, statePath := rrdpPaths(f.CacheDir, notify)
-		if old, e := loadRRDPState(statePath); e == nil && time.Since(old.LastSuccess) < f.fallbackAfter(dir) {
+		if old, e := loadRRDPState(statePath); e == nil && (held || time.Since(old.LastSuccess) < f.fallbackAfter(dir)) {
 			st.Result = "fallback-old"
 			f.record(st)
 			return dir
@@ -435,15 +466,24 @@ func (f *fetcher) ensureRsync(repo string) (string, bool) {
 		hkey := "rsync " + key
 		var err error
 		skip, h := f.skipUntil(hkey)
-		if skip.IsZero() {
-			ctx, cancel := context.WithTimeout(context.Background(), f.Timeout)
+		_, derr := os.Stat(rsyncDir(f.CacheDir, key))
+		held := skip.IsZero() && (f.pastDeadline() || (f.LowDisk && derr != nil)) // rrdp 와 같음 : 연속 실패로 세지 않음
+		switch {
+		case held:
+			err = errLowDisk
+			if f.pastDeadline() {
+				err = errRunDeadline
+				f.late.Add(1)
+			}
+		case skip.IsZero():
+			ctx, cancel := context.WithTimeout(context.Background(), f.fetchTimeout())
 			err = f.runRsync(ctx, key)
 			cancel()
-		} else {
+		default:
 			err = fmt.Errorf("skipped after %d failures until %s (last: %s)", h.failures, skip.Format(time.RFC3339), h.lastErr)
 		}
 		st := repoStatus{URI: key, Type: "rsync", Result: "ok", Start: start, Duration: time.Since(start)}
-		if skip.IsZero() {
+		if skip.IsZero() && !held {
 			f.repoDone(hkey, &st, err)
 		} else {
 			st.Skipped = true

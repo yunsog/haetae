@@ -127,28 +127,20 @@ func (d *daemon) handleAS(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	vrps := []vrpOut{}
-	for _, k := range cur.Full {
-		if k.ASN == asn {
-			vrps = append(vrps, newVRPOut(cur, view, k))
-		}
+	for _, k := range cur.byASN(asn) {
+		vrps = append(vrps, newVRPOut(cur, view, k))
 	}
 
 	var aspa any // 없으면 null
 	if ps, ok := cur.ASPAs[asn]; ok {
 		srcs := []srcOut{}
 		if view != nil {
-			for i := range view.Objects {
-				o := &view.Objects[i]
-				if o.Type != "asa" || o.Status != "valid" {
-					continue
+			for _, o := range view.aspaObjects(asn) {
+				exp := int64(0)
+				if a := view.ASPAs[aspaKey{asn, o.TA}]; a != nil {
+					exp = a.Expires.Unix()
 				}
-				if as := objASNs(o); len(as) == 1 && as[0] == asn {
-					exp := int64(0)
-					if a := view.ASPAs[aspaKey{asn, o.TA}]; a != nil {
-						exp = a.Expires.Unix()
-					}
-					srcs = append(srcs, srcOut{o.URI, o.TA, o.NotAfter, exp})
-				}
+				srcs = append(srcs, srcOut{o.URI, o.TA, o.NotAfter, exp})
 			}
 		}
 		aspa = map[string]any{"providers": ps, "sources": srcs}
@@ -298,7 +290,15 @@ func (d *daemon) handleJSONDelta(w http.ResponseWriter, r *http.Request) {
 	}
 	d.st.mu.RUnlock()
 	if !ok && to != ser {
-		http.Error(w, "serial range not in delta history (use json-delta without to for full set)", 404)
+		// 404 는 그대로, 본문만 원인별 (session 을 빠뜨린 경우를 기록 밖으로 잘못 알기 쉬움, 11-04)
+		msg := "serial range not in delta history (use json-delta without to for full set)"
+		switch {
+		case q.Get("session") == "" || q.Get("serial") == "":
+			msg = fmt.Sprintf("to needs session and serial (current session %d)", ses)
+		case q.Get("session") != strconv.Itoa(int(ses)):
+			msg = fmt.Sprintf("session %s does not match current session %d", q.Get("session"), ses)
+		}
+		http.Error(w, msg, 404)
 		return
 	}
 	if !ok {
@@ -336,7 +336,7 @@ func (d *daemon) handleJSONDelta(w http.ResponseWriter, r *http.Request) {
 			sep()
 			jsonDeltaVRP(bw, v)
 		}
-		for k := range cur.Keys {
+		for _, k := range cur.sortedKeys() {
 			sep()
 			jsonDeltaKey(bw, k)
 		}
@@ -345,8 +345,7 @@ func (d *daemon) handleJSONDelta(w http.ResponseWriter, r *http.Request) {
 			jsonDeltaASPA(bw, c, cur.ASPAs[c])
 		}
 	} else {
-		sortRTRVRPs(ann)
-		for _, v := range ann {
+		for _, v := range ann { // netDiffTo 가 정렬해 줌
 			sep()
 			jsonDeltaVRP(bw, v)
 		}
@@ -364,7 +363,6 @@ func (d *daemon) handleJSONDelta(w http.ResponseWriter, r *http.Request) {
 	bw.WriteString("],\n\"withdrawn\":[")
 	n = 0
 	if ok {
-		sortRTRVRPs(wdr)
 		for _, v := range wdr {
 			sep()
 			jsonDeltaVRP(bw, v)
@@ -383,10 +381,15 @@ func (d *daemon) handleJSONDelta(w http.ResponseWriter, r *http.Request) {
 	bw.WriteString("]}\n")
 }
 
-// clientWait : 이 주소가 kind (/json-delta 전체, 공개 쪽 /json 등) 를 받아도 되면 0 (그리고 지금 시각을 기록), 아니면 남은 시간
-// 간격 = -delta-full-interval, 0 = 제한 없음. 주소 = clientKey (IPv6 는 /64). 표가 커지면 지난 것만 지움 (주소 수 상한 대신)
+// clientWait : 이 주소가 kind (/json-delta 전체, 공개 쪽 /json 등) 를 받아도 되면 0 (그리고 기록), 아니면 남은 시간
+// 간격 = -delta-full-interval, 0 = 제한 없음. 주소 = clientKey (IPv6 는 /64)
 func (d *daemon) clientWait(kind, remote string) time.Duration {
-	iv := d.c().DeltaFullInterval
+	return d.clientWaitEvery(kind, remote, d.c().DeltaFullInterval)
+}
+
+// clientWaitEvery : clientWait 를 간격 iv 로. 표에는 "다시 받아도 되는 시각" 을 둠 (종류마다 간격이 달라도 정리가 맞게)
+// 정리는 표가 1000 개 넘을 때 1 초에 한 번만 (전에는 요청마다 표 전체를 훑음)
+func (d *daemon) clientWaitEvery(kind, remote string, iv time.Duration) time.Duration {
 	if iv <= 0 {
 		return 0
 	}
@@ -397,17 +400,18 @@ func (d *daemon) clientWait(kind, remote string) time.Duration {
 	if d.fullLast == nil {
 		d.fullLast = map[string]time.Time{}
 	}
-	if t, ok := d.fullLast[host]; ok && now.Sub(t) < iv {
-		return iv - now.Sub(t)
+	if until, ok := d.fullLast[host]; ok && now.Before(until) {
+		return until.Sub(now)
 	}
-	if len(d.fullLast) >= 1000 {
-		for h, t := range d.fullLast {
-			if now.Sub(t) >= iv {
+	if len(d.fullLast) >= 1000 && now.Sub(d.fullSweep) >= time.Second {
+		for h, until := range d.fullLast {
+			if !now.Before(until) {
 				delete(d.fullLast, h)
 			}
 		}
+		d.fullSweep = now
 	}
-	d.fullLast[host] = now
+	d.fullLast[host] = now.Add(iv)
 	return 0
 }
 

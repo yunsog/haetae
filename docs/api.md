@@ -88,10 +88,13 @@ path per request.
 cannot be bound (port in use, bad address) is logged
 (`http listen <addr>: ...`) and skipped; Haetae keeps running with the other
 addresses and RTR. Each listener accepts at most 256 concurrent connections
-(further connections wait in the kernel backlog). Timeouts: request header
-10 s, whole request 30 s, idle keep-alive connection 2 minutes; there is no
-write timeout, so large files can be downloaded over slow links. Request
-headers are limited to 64 KiB.
+(further connections wait in the kernel backlog). Clients outside the internal
+allow list may hold at most 8 connections each (IPv6 per /64) and 224 in
+total; extra connections are closed at once, and 32 connections stay
+available to internal clients. Timeouts: request header 10 s, whole request
+30 s, idle keep-alive connection 2 minutes; there is no overall write timeout,
+so large files can be downloaded over slow links, but a response that cannot
+send 256 KiB within 60 s is cut. Request headers are limited to 64 KiB.
 
 Example: internal API for a management network on a second address.
 
@@ -120,7 +123,8 @@ Paths available to public clients:
 |---|---|
 | `GET /status`, `GET /api/v1/status` | Without internal fields: `rtr_clients`, `config`, `slurm`, `mem_mb`, `started`, `handover` and `last_run.mem_mb` are left out |
 | `GET /api/v1/validity/{AS}/{prefix}` | As for internal clients |
-| `GET /api/v1/as/{AS}`, `GET /api/v1/prefix/{prefix}` | As for internal clients |
+| `GET /api/v1/as/{AS}` | As for internal clients, at most once a second per client (otherwise 429 with `Retry-After`) |
+| `GET /api/v1/prefix/{prefix}` | As for internal clients |
 | `GET /api/v1/aspa/verify` | As for internal clients |
 | `GET /api/v1/vrps/delta` | As for internal clients |
 | `GET /json-delta` | As for internal clients (the full set is already limited per client) |
@@ -209,7 +213,7 @@ minutes is fine.
  "stale": false,
  "rtr_clients": [
   {"remote": "192.0.2.10:51234", "transport": "tcp", "version": 1,
-   "since": "2026-11-01T09:18:08Z", "last_query": "2026-11-01T09:28:08Z", "serial": 381}
+   "since": "2026-11-01T09:18:08Z", "last_query": "2026-11-01T09:28:08Z", "serial": 381, "trusted": false}
  ],
  "tas": [{"name": "apnic", "uri": "rsync://rpki.apnic.net/repository/apnic-rpki-root-iana-origin.cer"}],
  "last_run": {
@@ -245,7 +249,7 @@ minutes is fine.
 | `unsafe_vrps` | See [/api/v1/unsafe](#get-apiv1unsafe). Present after the first run. |
 | `rtr_open` | `true` only when every configured RTR listener (plain TCP and TLS) is open. A listener that failed to open (for example, port in use) is retried after each applied run. |
 | `stale` | `true` while the served set was validated longer ago than `-stale-warn` (default 1 hour; always `false` when it is 0). Checked every minute. See [GET /healthz](#get-healthz). |
-| `rtr_clients` | Connected routers, or `null`. `transport` is `tcp`, `tcp-md5`, `tcp-ao` or `tls`. `version` is the negotiated RTR version (`-1` before the first PDU). `serial` is the last serial sent. Routers connected over SSH appear as `127.0.0.1` with `tcp`. |
+| `rtr_clients` | Connected routers, or `null`. `transport` is `tcp`, `tcp-md5`, `tcp-ao` or `tls`. `version` is the negotiated RTR version (`-1` before the first PDU). `serial` is the last serial sent. `trusted` is true for addresses in `rtr.trusted`. Routers connected over SSH appear as `127.0.0.1` with `tcp`. |
 | `tas` | Trust anchor certificates, the starting points for [/api/v1/ca](#get-apiv1cauri). |
 | `last_run` | The last run. `applied: false` means Haetae kept serving the previous set; `reason` says why (for example a failed TA or a VRP drop held by `-hold-drop`). `reason` can also carry a warning when `applied` is true (`WARNING VRP drop ...`). `failed_tas` lists TAs that failed. |
 | `last_run.counts` | Keys are `<type> valid` or `<type> rejected` (type = `cer crl mft roa asa gbr spl tak`), `warn: <message>`, and `unknown file type .<ext>` for non-standard files. |
@@ -506,6 +510,8 @@ response is the full set with `"reset": true`.
 - With `reset: true`, `announced` holds the complete set and `withdrawn` is
   empty: replace the local copy.
 - Each element is on its own line.
+- The order is fixed: VRPs by address, prefix length, maxLength, ASN; router keys by ASN, SKI; ASPA by customer
+  (0.3.0; the same order is used for RTR and `/api/v1/vrps/delta`).
 - ASPA is per customer. When a customer's provider list changes, `announced`
   holds the complete new list. When a customer disappears, it is in
   `withdrawn` with an empty `providers` list.
@@ -514,7 +520,8 @@ response is the full set with `"reset": true`.
 - `to`: `serial=M-1&to=M` gives the exact changes of run M; ASPA lists are as
   of serial M. `to` greater than the current serial returns 400. If the range is
   not in the history (or the session does not match) and `to` is not the
-  current serial, the response is 404, not a full set.
+  current serial, the response is 404, not a full set; the body says why (missing `session` /
+  `serial`, session mismatch, or range not in history).
 - Returns 503 if there is no data yet.
 
 **Rate limit on full sets.** A full response (`reset: true`) is about 85 MB and
@@ -885,7 +892,7 @@ Retry state (present only when set):
 | `consecutive_failures` | Failed attempts in a row (0 / absent after a success) |
 | `last_success` | Last successful fetch since the process started |
 | `next_try` | The repository is not contacted before this time |
-| `skipped` | `true` if this run did not contact the repository because of `next_try`; the result is then `fallback-old`, `fallback-rsync` or `failed` as for a failure, with the error `skipped after N failures until <time> (last: <error>)` |
+| `skipped` | `true` if this run did not contact the repository: because of `next_try` (error `skipped after N failures until <time> (last: <error>)`), because the fetch deadline had passed (`not fetched: run deadline passed ...`) or, for a new repository, because of low disk space (`not fetched: low disk space ...`). The result is then `fallback-old`, `fallback-rsync` or `failed` as for a failure. The last two do not count as failures |
 
 After 3 failures in a row a repository (RRDP notification URI or rsync
 module) waits 10 minutes before the next attempt, then 20, 40, at most
@@ -947,7 +954,7 @@ These are internal formats; use the API instead of reading them.
 | Payload | v0: IPv4 / IPv6 Prefix. v1: + Router Key. v2: + ASPA |
 | Timers (v1, v2) | refresh 600, retry 300, expire 7200 seconds |
 | Stale data | `-stale-close` (`[rtr] stale-close`, default off): close RTR and drop all sessions when the served set is older than this, so routers fail over. See [GET /healthz](#get-healthz) |
-| Limits | `-rtr-max-conns` (256) concurrent connections, `-rtr-max-per-ip` (4, IPv6 per /64) per address; extra connections are closed. First PDU within 30 s, then at least one PDU per 2 hours, or the connection is closed. A full set (Reset Query) at most once a minute per connection; otherwise Error Report code 2 "No Data Available" and the session stays up |
+| Limits | Untrusted clients: `-rtr-max-conns` (256) concurrent connections, `-rtr-max-per-ip` (4, IPv6 per /64) per address, 16 per IPv6 /48. Trusted prefixes (`-rtr-trusted`): only `-rtr-trusted-max-conns` (20000), counted apart. Extra connections are closed. First PDU within 30 s, then at least one PDU per 2 hours, or the connection is closed. A full set (Reset Query) at most once a minute per connection and twice a minute per untrusted address; otherwise Error Report code 2 "No Data Available" and the session stays up |
 
 ### Version negotiation
 

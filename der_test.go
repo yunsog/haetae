@@ -4,6 +4,7 @@ package main
 
 import (
 	"net/netip"
+	"runtime"
 	"testing"
 )
 
@@ -88,4 +89,32 @@ func rangeOf(t *testing.T, s string) ipRange {
 		t.Fatal(err)
 	}
 	return prefixRange(p)
+}
+
+// 자식이 상한보다 많으면 담기 전에 거부 (11-05 검토 1 : 빈 SEQUENCE 1 천만 개로 수 GB 할당)
+func TestDerSeqLimit(t *testing.T) {
+	const n = 1000000 // 원소 2 바이트 -> 몸통 2 MB
+	body := make([]byte, 2*n)
+	for i := 0; i < n; i++ {
+		body[2*i] = 0x30
+	}
+	der := append([]byte{0x30, 0x83, byte(len(body) >> 16), byte(len(body) >> 8), byte(len(body))}, body...)
+	top, err := derOne(der)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := derSeq(top, 0, 10); err == nil {
+		t.Fatal("accepted over max")
+	}
+	// 할당 바이트 : 다 담으면 노드 72 B x 100 만 = 70 MB 넘음, 상한에서 멈추면 몇 KB
+	var m0, m1 runtime.MemStats
+	runtime.ReadMemStats(&m0)
+	derSeq(top, 0, 10)
+	runtime.ReadMemStats(&m1)
+	if got := m1.TotalAlloc - m0.TotalAlloc; got > 1<<20 {
+		t.Errorf("allocated %d bytes, want stop at max", got)
+	}
+	if c, err := derSeq(top, 0, n); err != nil || len(c) != n {
+		t.Fatalf("at max: %d %v", len(c), err)
+	}
 }

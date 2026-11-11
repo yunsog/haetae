@@ -16,6 +16,7 @@ package main
 import (
 	"bytes"
 	"crypto/sha256"
+	"crypto/x509"
 	"fmt"
 	"net/netip"
 	"os"
@@ -124,12 +125,53 @@ type validator struct {
 	aspas     map[aspaKey]*aspaOut
 	rkeys     []routerKeyOut
 	objects   []objInfo
-	seenCA    map[string]bool     // manifest URI -> 이미 처리 (같은 CA 두 번 방지)
-	validSeen map[string]bool     // 이번 회차에 본 직전 정상본 폴더 (나머지는 cleanValid 가 지움)
-	count     map[string]int      // 통계 (종류별 valid / rejected, 경고)
-	warnEx    map[string][]string // 경고마다 예시 몇 개 (원인 확인용)
+	seenCA    map[string]bool        // CA 인증서 DER 의 sha256 -> 이미 처리 (같은 인증서 두 번 / 순환 방지)
+	validSeen map[string]bool        // 이번 회차에 본 직전 정상본 폴더 (나머지는 cleanValid 가 지움)
+	validLock map[string]*sync.Mutex // 직전 정상본 폴더마다 하나씩 (같은 폴더를 두 CA 가 동시에 쓰지 않게)
+	count     map[string]int         // 통계 (종류별 valid / rejected, 경고)
+	warnEx    map[string][]string    // 경고마다 예시 몇 개 (원인 확인용)
 	failedTA  []string
-	caBySKI   map[string][]*caRecord // KeepCAs 일 때만
+	caBySKI   map[string][]*caRecord     // KeepCAs 일 때만
+	taRepos   map[string]map[string]bool // TA -> 이번 회차에 쓴 저장소 열쇠 (maxReposPerTA, repo_guard.go)
+
+	ppBudget *byteBudget // 동시에 메모리에 올린 publication point 바이트 (maxPPInFlight)
+}
+
+// publication point 하나 (manifest + 나열된 파일) 의 바이트 상한과, 동시에 메모리에 올리는 합 (11-05 검토 12).
+// 나열된 파일은 해시 확인 뒤 CA 처리가 끝날 때까지 메모리에 있음 -> CA 하나 상한만으로는 동시 처리 (Workers) 만큼 곱해짐.
+// 2026-11 운영 최대 = ARIN 한 곳 109 MB (파일 48,934 개). 합이 차면 다음 CA 는 앞의 것이 끝날 때까지 기다림
+const (
+	maxPPBytes    = 512 << 20
+	maxPPInFlight = 2 << 30
+)
+
+// byteBudget : 바이트 단위 세마포어 (acquire 는 남은 양이 될 때까지 기다림). n 은 전체보다 크면 안 됨
+type byteBudget struct {
+	mu   sync.Mutex
+	cond *sync.Cond
+	left int64
+}
+
+func newByteBudget(n int64) *byteBudget {
+	b := &byteBudget{left: n}
+	b.cond = sync.NewCond(&b.mu)
+	return b
+}
+
+func (b *byteBudget) acquire(n int64) {
+	b.mu.Lock()
+	for b.left < n {
+		b.cond.Wait()
+	}
+	b.left -= n
+	b.mu.Unlock()
+}
+
+func (b *byteBudget) release(n int64) {
+	b.mu.Lock()
+	b.left += n
+	b.mu.Unlock()
+	b.cond.Broadcast()
 }
 
 func newValidator(cacheDir string, now time.Time, workers int) *validator {
@@ -143,6 +185,9 @@ func newValidator(cacheDir string, now time.Time, workers int) *validator {
 		aspas:     map[aspaKey]*aspaOut{},
 		seenCA:    map[string]bool{},
 		validSeen: map[string]bool{},
+		validLock: map[string]*sync.Mutex{},
+		taRepos:   map[string]map[string]bool{},
+		ppBudget:  newByteBudget(maxPPInFlight),
 		count:     map[string]int{},
 		warnEx:    map[string][]string{},
 	}
@@ -181,10 +226,21 @@ func (v *validator) run(tals []*tal) {
 func (v *validator) spawn(ctx caCtx) {
 	v.wg.Add(1)
 	go func() {
+		defer v.wg.Done()
 		// 저장소 수집은 검증 동시 수 (sem) 밖에서 (기다리는 동안 다른 CA 검증이 돌게)
 		ctx.Base = v.CacheDir
 		if v.Fetch != nil {
-			ctx.Base = v.Fetch.ensure(ctx.Cert)
+			if err := v.repoAllowed(&ctx); err != nil {
+				v.reject("mft", ctx.Cert.Manifest, ctx.TA, ctx.URI, err)
+				v.addUnsafe(ctx.URI, ctx.IPs)
+				return
+			}
+			if ctx.Base = v.Fetch.ensure(ctx.Cert); ctx.Base == "" {
+				// 받은 데이터가 전혀 없음 (rsync 끔 + RRDP 실패, 수집 중 panic). 빈 기준 = 현재 폴더 기준 상대 경로가 되므로 실패로
+				v.reject("mft", ctx.Cert.Manifest, ctx.TA, ctx.URI, fmt.Errorf("no repository data"))
+				v.addUnsafe(ctx.URI, ctx.IPs)
+				return
+			}
 		}
 		v.sem <- struct{}{}
 		defer func() {
@@ -193,10 +249,42 @@ func (v *validator) spawn(ctx caCtx) {
 				v.addUnsafe(ctx.URI, ctx.IPs)
 			}
 			<-v.sem
-			v.wg.Done()
 		}()
 		v.processCA(ctx)
 	}()
+}
+
+// repoAllowed : 받기 전에 저장소 주소 확인 (11-05 검토 10)
+//   - notify 정규화 (canonicalNotify). query / fragment 등이 있으면 notify 를 쓰지 않고 rsync 로 (경고)
+//   - TA 하나 아래 서로 다른 저장소가 maxReposPerTA 를 넘으면 그 CA 실패
+func (v *validator) repoAllowed(ctx *caCtx) error {
+	c := ctx.Cert
+	if c.Notify != "" {
+		n, err := canonicalNotify(c.Notify)
+		if err != nil {
+			v.warn("rpkiNotify not usable, using rsync", c.Notify+": "+err.Error())
+			n = ""
+		}
+		c.Notify = n // 직전 정상본 폴더 (validPPDir) 도 이 값으로
+	}
+	key := "rrdp " + c.Notify
+	if c.Notify == "" {
+		key = "rsync " + rsyncModule(c.CARepository)
+	}
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	set := v.taRepos[ctx.TA]
+	if set == nil {
+		set = map[string]bool{}
+		v.taRepos[ctx.TA] = set
+	}
+	if !set[key] {
+		if len(set) >= maxReposPerTA {
+			return fmt.Errorf("too many repositories under TA %s (max %d)", ctx.TA, maxReposPerTA)
+		}
+		set[key] = true
+	}
+	return nil
 }
 
 // ---- 기록 도우미 ----
@@ -399,12 +487,15 @@ func (v *validator) processCA(ctx caCtx) {
 		v.addUnsafe(ctx.URI, ctx.IPs)
 		return
 	}
+	// 같은 CA 판정은 인증서 자체로 : manifest URI 로 하면 아무 CA 가 남의 manifest URI 를 쓴 자식 CA 를 먼저 내세워
+	// 진짜 CA 를 "duplicate" 로 빠뜨릴 수 있음 (11-05 검토 3). 순환은 같은 인증서 파일이 다시 나오는 것으로 끊김 (+ 깊이 상한)
+	sum := sha256.Sum256(c.X509.Raw)
 	v.mu.Lock()
-	dup := v.seenCA[c.Manifest]
-	v.seenCA[c.Manifest] = true
+	dup := v.seenCA[string(sum[:])]
+	v.seenCA[string(sum[:])] = true
 	v.mu.Unlock()
 	if dup {
-		v.warn("duplicate CA (same manifest URI)", c.Manifest)
+		v.warn("duplicate CA (same certificate)", ctx.URI)
 		return
 	}
 
@@ -414,6 +505,7 @@ func (v *validator) processCA(ctx caCtx) {
 		v.addUnsafe(ctx.URI, ctx.IPs)
 		return
 	}
+	defer pp.done() // 나열된 파일을 다 쓴 뒤 바이트 예산을 돌려줌
 	mft, crl, crlURI, files := pp.mft, pp.crl, pp.crlURI, pp.files
 	if v.KeepCAs {
 		v.mu.Lock()
@@ -440,51 +532,93 @@ func (v *validator) processCA(ctx caCtx) {
 
 	for _, f := range files {
 		ext := strings.TrimPrefix(filepath.Ext(f.Name), ".")
-		switch ext {
-		case "crl":
-			// 위에서 처리
-		case "cer":
-			v.processCert(&ctx, crl, crlURI, f, ch)
-		case "roa", "asa", "spl", "gbr", "tak":
-			v.processSigned(&ctx, crl, crlURI, f, ext, ch)
-		default:
-			v.inc("unknown file type " + ext)
-		}
+		v.safeFile(&ctx, f, ext, func() {
+			switch ext {
+			case "crl":
+				// 위에서 처리
+			case "cer":
+				v.processCert(&ctx, crl, crlURI, f, ch)
+			case "roa", "asa", "spl", "gbr", "tak":
+				v.processSigned(&ctx, crl, crlURI, f, ext, ch)
+			default:
+				v.inc("unknown file type " + ext)
+			}
+		})
 	}
+}
+
+// safeFile : 나열된 파일 하나를 처리. panic 이면 그 파일만 거부하고 다음 파일로 (11-05 검토 13).
+// 전에는 CA 전체를 거부로 적으면서도 그 전에 넣은 VRP / 띄운 자식 CA 는 그대로 나가 기록과 출력이 어긋났음.
+// 결과를 넣는 곳은 v.mu 를 defer 로 풀어야 함 (panic 때 잠금이 남으면 아래 reject 가 멈춤)
+func (v *validator) safeFile(ctx *caCtx, f mftEntry, ext string, fn func()) {
+	defer func() {
+		if p := recover(); p != nil {
+			v.reject(ext, f.URI, ctx.TA, ctx.URI, fmt.Errorf("panic: %v %s", p, debug.Stack()))
+		}
+	}()
+	fn()
 }
 
 // publicationPoint : 받은 캐시의 publication point. 틀리면 직전 정상본 (ValidDir, valid.go) 으로 다시. fallback = 직전 정상본을 씀
 func (v *validator) publicationPoint(ctx *caCtx) (*pubPoint, bool, error) {
 	c := ctx.Cert
-	pp, err := v.loadPublicationPoint(ctx, func(uri string) (string, error) { return uriPath(ctx.Base, uri) })
+	pp, err := v.loadPublicationPoint(ctx, func(uri string) (string, error) { return uriPath(ctx.Base, uri) }, v.ppBudget)
 	if v.ValidDir == "" {
 		return pp, false, err
 	}
-	dir, derr := validPPDir(v.ValidDir, c.Manifest)
-	if derr != nil {
-		return pp, false, err
-	}
+	dir := validPPDir(v.ValidDir, c)
+	return v.withValid(dir, c.Manifest, pp, err, func() (*pubPoint, error) { return v.loadPublicationPoint(ctx, validAt(dir), nil) })
+}
+
+// withValid : 새로 받은 것 (pp, err) 과 저장본 (dir, loadOld 로 다시 검증) 중 쓸 것을 고르고, 새것이 맞으면 저장
+//   - 저장본 없음 : 새것 그대로 (맞으면 저장)
+//   - 새것이 맞고 번호가 같거나 큼 : 새것 (저장)
+//   - 새것이 틀림, 또는 번호가 작아짐 : 저장본이 지금도 유효하면 저장본 (fallback)
+//   - 번호가 작아졌는데 저장본이 이미 유효하지 않음 : 되돌릴 대상이 없으니 새것을 받음 (CA 를 다시 만듦 등, 11-05 검토 4)
+func (v *validator) withValid(dir, mftURI string, pp *pubPoint, err error, loadOld func() (*pubPoint, error)) (*pubPoint, bool, error) {
 	v.mu.Lock()
 	v.validSeen[dir] = true
-	v.mu.Unlock()
-	prev := storedNumber(dir)
-	if err == nil && prev != nil && pp.mft.Number.Cmp(prev) < 0 {
-		err = fmt.Errorf("manifest number %s lower than previous %s", pp.mft.Number, prev)
+	lk := v.validLock[dir]
+	if lk == nil {
+		lk = &sync.Mutex{}
+		v.validLock[dir] = lk
 	}
-	if err == nil {
-		if serr := storeValid(dir, path.Base(c.Manifest), pp); serr != nil {
-			v.warn("cannot store valid publication point", c.Manifest+": "+serr.Error())
+	v.mu.Unlock()
+	lk.Lock()
+	defer lk.Unlock()
+
+	store := func() {
+		if serr := storeValid(dir, path.Base(mftURI), pp); serr != nil {
+			v.warn("cannot store valid publication point", mftURI+": "+serr.Error())
 		}
+	}
+	prev := storedNumber(dir)
+	if prev == nil {
+		if err == nil {
+			store()
+		}
+		return pp, false, err
+	}
+	back := err == nil && pp.mft.Number.Cmp(prev) < 0
+	if err == nil && !back {
+		store()
 		return pp, false, nil
 	}
-	if prev == nil {
-		return nil, false, err // 직전 정상본 없음
+	old, oerr := loadOld()
+	if back {
+		if oerr != nil {
+			v.warn("manifest number went back, previous copy no longer valid: accepted",
+				fmt.Sprintf("%s: %s < %s", mftURI, pp.mft.Number, prev))
+			store()
+			return pp, false, nil
+		}
+		err = fmt.Errorf("manifest number %s lower than previous %s", pp.mft.Number, prev)
 	}
-	old, oerr := v.loadPublicationPoint(ctx, validAt(dir))
 	if oerr != nil {
 		return nil, false, fmt.Errorf("%w (previous valid copy: %v)", err, oerr)
 	}
-	v.warn("manifest failed, using previous valid publication point", c.Manifest+": "+err.Error())
+	v.warn("manifest failed, using previous valid publication point", mftURI+": "+err.Error())
+	pp.done() // 번호가 작아진 새것 (틀린 새것은 이미 nil)
 	return old, true, nil
 }
 
@@ -496,11 +630,23 @@ type pubPoint struct {
 	crlURI string
 	files  []mftEntry
 	paths  map[string]string // 파일 이름 -> 읽은 곳 (직전 정상본 저장 때 hard link 원본)
+
+	budget *byteBudget // 잡은 바이트를 돌려줄 곳 (nil = 안 잡음)
+	held   int64
+}
+
+// done : 나열된 파일을 다 쓴 뒤 잡은 바이트를 돌려줌 (여러 번 불러도 한 번만, nil 이어도 됨)
+func (pp *pubPoint) done() {
+	if pp != nil && pp.budget != nil {
+		pp.budget.release(pp.held)
+		pp.budget, pp.held = nil, 0
+	}
 }
 
 // loadPublicationPoint : manifest + CRL + 나열된 파일 전부 (하나라도 틀리면 오류 = CA 전체 버림)
 // at : 객체 URI -> 읽을 파일 (받은 캐시 = uriPath(ctx.Base, uri), 직전 정상본 = 그 폴더의 파일 이름)
-func (v *validator) loadPublicationPoint(ctx *caCtx, at func(uri string) (string, error)) (*pubPoint, error) {
+// budget : 나열된 파일을 읽기 전에 그 크기만큼 잡음 (nil = 안 잡음 : 직전 정상본으로 다시 읽을 때, 드문 길이라 기다리다 서로 막히지 않게)
+func (v *validator) loadPublicationPoint(ctx *caCtx, at func(uri string) (string, error), budget *byteBudget) (_ *pubPoint, err error) {
 	c := ctx.Cert
 	paths := map[string]string{}
 	mp, err := at(c.Manifest)
@@ -537,20 +683,45 @@ func (v *validator) loadPublicationPoint(ctx *caCtx, at func(uri string) (string
 	}
 	v.warnSKI(ee, c.Manifest)
 
-	// 나열된 파일 : 같은 폴더 (manifest 위치 기준), 해시 확인
+	// 나열된 파일 : 같은 폴더 (manifest 위치 기준), 해시 확인.
+	// 먼저 크기만 더해 상한 확인 + 그만큼 잡음 (maxPPBytes / maxPPInFlight). 읽은 양이 잰 것보다 크면 (그 사이 바뀜) 오류
 	base := c.Manifest[:strings.LastIndexByte(c.Manifest, '/')+1]
-	var files []mftEntry
-	var crlEntry *mftEntry
+	total := int64(len(der))
 	for _, mf := range mft.Files {
-		uri := base + mf.Name
-		p, err := at(uri)
+		p, err := at(base + mf.Name)
 		if err != nil {
 			return nil, err
 		}
 		paths[mf.Name] = p
-		data, err := readObject(p)
+		st, err := os.Stat(p)
 		if err != nil {
 			return nil, fmt.Errorf("listed file %s: %w", mf.Name, err)
+		}
+		if total += st.Size(); total > maxPPBytes {
+			return nil, fmt.Errorf("publication point larger than %d MB", maxPPBytes>>20)
+		}
+	}
+	pp := &pubPoint{mft: mft, mftDER: der, paths: paths}
+	if budget != nil {
+		budget.acquire(total)
+		pp.budget, pp.held = budget, total
+		defer func() {
+			if err != nil {
+				pp.done()
+			}
+		}()
+	}
+	read := int64(len(der))
+	var files []mftEntry
+	var crlEntry *mftEntry
+	for _, mf := range mft.Files {
+		uri := base + mf.Name
+		data, err := readObject(paths[mf.Name])
+		if err != nil {
+			return nil, fmt.Errorf("listed file %s: %w", mf.Name, err)
+		}
+		if read += int64(len(data)); read > total {
+			return nil, fmt.Errorf("listed file %s: changed while reading", mf.Name)
 		}
 		if sha256.Sum256(data) != mf.Hash {
 			return nil, fmt.Errorf("listed file %s: hash mismatch", mf.Name)
@@ -586,7 +757,8 @@ func (v *validator) loadPublicationPoint(ctx *caCtx, at func(uri string) (string
 	if crl.Revoked[ee.X509.SerialNumber.String()] {
 		return nil, fmt.Errorf("manifest EE is revoked")
 	}
-	return &pubPoint{mft: mft, mftDER: der, crl: crl, crlURI: crlURI, files: files, paths: paths}, nil
+	pp.crl, pp.crlURI, pp.files = crl, crlURI, files
+	return pp, nil
 }
 
 // readObject : 크기 상한을 지키며 파일 읽기
@@ -659,6 +831,7 @@ func (v *validator) processSigned(ctx *caCtx, crl *rpkiCRL, crlURI string, f mft
 	var err error
 	var roa *rpkiROA
 	var aspa *rpkiASPA
+	var tak *rpkiTAK
 
 	switch ext {
 	case "roa":
@@ -683,15 +856,14 @@ func (v *validator) processSigned(ctx *caCtx, crl *rpkiCRL, crlURI string, f mft
 			summary = map[string]any{"vcard": g.Props, "warnings": g.Warn}
 		}
 	case "tak":
-		var t *rpkiTAK
-		if t, err = parseTAK(f.Data); err == nil {
-			so = t.signedObject
-			s := map[string]any{"current": fmt.Sprintf("%X", t.Current.SKI)}
-			if t.Predecessor != nil {
-				s["predecessor"] = fmt.Sprintf("%X", t.Predecessor.SKI)
+		if tak, err = parseTAK(f.Data); err == nil {
+			so = tak.signedObject
+			s := map[string]any{"current": fmt.Sprintf("%X", tak.Current.SKI)}
+			if tak.Predecessor != nil {
+				s["predecessor"] = fmt.Sprintf("%X", tak.Predecessor.SKI)
 			}
-			if t.Successor != nil {
-				s["successor"] = fmt.Sprintf("%X", t.Successor.SKI)
+			if tak.Successor != nil {
+				s["successor"] = fmt.Sprintf("%X", tak.Successor.SKI)
 			}
 			summary = s
 		}
@@ -716,10 +888,20 @@ func (v *validator) processSigned(ctx *caCtx, crl *rpkiCRL, crlURI string, f mft
 		v.warn("EE signedObject does not match location", f.URI)
 	}
 	v.warnSKI(so.EE, f.URI)
+	if tak != nil {
+		v.checkTAK(ctx, tak, f.URI)
+	}
 	ee := so.EE.X509
 	exp := minTime(ch.Exp, ee.NotAfter)
 
+	v.addSigned(ctx, f, roa, aspa, ee, exp, ch, &summary)
+	v.valid(ext, f.URI, ctx.TA, ctx.URI, f.Data, ee.NotBefore, ee.NotAfter, summary)
+}
+
+// addSigned : ROA 의 VRP / ASPA 의 provider 를 결과에 넣음 (검사가 다 끝난 뒤 한 번에, 잠금은 defer 로 = panic 이어도 풀림)
+func (v *validator) addSigned(ctx *caCtx, f mftEntry, roa *rpkiROA, aspa *rpkiASPA, ee *x509.Certificate, exp time.Time, ch chainTimes, summary *any) {
 	v.mu.Lock()
+	defer v.mu.Unlock()
 	switch {
 	case roa != nil:
 		src := vrpSource{URI: f.URI, TA: ctx.TA, NB: ee.NotBefore.Unix(), NA: ee.NotAfter.Unix(),
@@ -734,7 +916,7 @@ func (v *validator) processSigned(ctx *caCtx, crl *rpkiCRL, crlURI string, f mft
 			v.vrpSrc[k] = append(v.vrpSrc[k], src)
 			pfx = append(pfx, roaPrefixOut{r.Prefix, r.MaxLength})
 		}
-		summary = map[string]any{"asn": roa.ASN, "vrps": len(roa.VRPs), "prefixes": pfx}
+		*summary = map[string]any{"asn": roa.ASN, "vrps": len(roa.VRPs), "prefixes": pfx}
 	case aspa != nil:
 		k := aspaKey{aspa.Customer, ctx.TA}
 		a := v.aspas[k]
@@ -749,8 +931,6 @@ func (v *validator) processSigned(ctx *caCtx, crl *rpkiCRL, crlURI string, f mft
 			a.Expires = exp
 		}
 	}
-	v.mu.Unlock()
-	v.valid(ext, f.URI, ctx.TA, ctx.URI, f.Data, ee.NotBefore, ee.NotAfter, summary)
 }
 
 // roaCovered : ROA 의 prefix 가 모두 EE 의 (inherit 푼) IP 자원 안에 있는지

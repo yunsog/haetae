@@ -1,6 +1,7 @@
 # /etc/haetae/haetae.conf : Haetae configuration (example, every key with its default unless noted)
 #
-# Format : "key = value" under a [section]. Everything after # is a comment.
+# Format : "key = value" under a [section]. Everything after # is a comment (except inside "double quotes").
+# A value may be quoted; the quotes are removed (needed only if it contains #).
 # Lists are comma separated; a value ending in a comma continues on the next line.
 # A missing key = default. Command line options win over this file.
 # Unknown key / duplicate key / invalid value = Haetae refuses to start (a typo must not empty an allow list).
@@ -23,6 +24,7 @@ slurm =                              # SLURM local exceptions file (RFC 8416). e
 [fetch]
 interval = 10m                       # cycle interval (fetch + validate)                             option -interval
 jobs     = 32                        # repositories fetched at the same time                         option -fetch-j
+deadline = 20m                       # fetch deadline per run: repositories not reached use previous data (0 = none, else >= 5m)  option -fetch-deadline
 rsync    = true                      # fall back to rsync when RRDP keeps failing                    option -norsync (= false)
 
 
@@ -45,6 +47,9 @@ retry   = 300                        # retry interval (seconds, 1..7200)        
 expire  = 7200                       # expire interval (seconds, 600..172800)                        option -rtr-expire
 max-conns  = 256                     # concurrent RTR connections (0 = no limit)                     option -rtr-max-conns
 max-per-ip = 4                       # concurrent connections per address (IPv6 per /64)             option -rtr-max-per-ip
+trusted =                            # your routers' prefixes: always allowed, not subject to the    option -rtr-trusted
+                                     #   two limits above (each address counted alone), only to trusted-max-conns
+trusted-max-conns = 20000            # concurrent connections from trusted prefixes (0 = no limit)   option -rtr-trusted-max-conns
 stale-close = 0                      # close RTR when the set is older (0 = off, else >= 30m)        option -stale-close
                                      #   routers then fail over to another RP
 

@@ -1,5 +1,90 @@
 # Changes
 
+## 0.3.0 (2026-11-11)
+
+Fixes from a second full code review (resource limits against hostile
+repositories and clients), a stricter systemd sandbox, and prebuilt binaries.
+Still a test deployment: run it next to an established RP.
+
+### Binaries
+
+- Static Linux binaries for amd64 and arm64 are attached to the release
+  (`haetae-0.3.0-linux-amd64`, `haetae-0.3.0-linux-arm64`, `SHA256SUMS`). No
+  dependencies; the TALs are built in. They are built from the tag with
+  `CGO_ENABLED=0 go build -trimpath -ldflags='-s -w'`, so the same Go version
+  gives the same files.
+
+### Upgrading
+
+- Upgrade from 0.2.0 with `tools/upgrade.sh` (no restart, RTR sessions stay).
+- The new `deploy/haetae.service` adds sandboxing (no capabilities, private
+  devices, `ProtectProc=invisible`, `SystemCallFilter=@system-service`,
+  `MemoryDenyWriteExecute`, ...). A seamless upgrade does not reload the unit
+  file: install it, run `systemctl daemon-reload` and restart once (routers
+  reconnect with the same session).
+- Upgrading directly from 0.1.0 now starts a new RTR session (the pre-0.2.0
+  state files are no longer read); routers fetch everything once. Go through
+  0.2.0 first to keep the session.
+
+### Validation
+
+- TAK (RFC 9691): when a TAK issued by a TA announces a successor key, Haetae
+  logs `WARNING TA key rollover announced` on every cycle and counts the warning
+  `TAK announces successor TA key` (summary.txt, status API, `/metrics`). The TAL
+  is not switched automatically.
+- The stored copy of a publication point (RFC 9286 section 6.7) is keyed by the
+  CA public key, RRDP notify URI and manifest URI, so a CA that copies another
+  CA's manifest URI cannot replace the other CA's copy.
+- A manifest number lower than the stored one is accepted when the stored copy
+  is no longer valid (for example expired), so a re-created CA comes back.
+- A panic while processing one object rejects only that object
+  (`panic: ...`); the rest of the CA is processed.
+- DER: the element count limit is checked while children are collected, not
+  afterwards.
+
+### Fetching
+
+- New `fetch.deadline` (default 20 minutes): repositories not reached by then
+  are validated from previous data and do not count as failures.
+- RRDP: every XML token and the text of each `publish` element is limited
+  before it is held in memory.
+- Notify URIs are normalised (same repository fetched once); URIs with a query,
+  fragment or user info are not used (rsync instead). At most 1,000 repositories
+  below one TA.
+- New repositories are not fetched when less than 10 GB is free on the cache
+  file system; repositories unused for 3 days are removed from the cache.
+- A publication point may total 512 MB, and at most 2 GB of publication points
+  are held in memory at once.
+- A cycle longer than 3 minutes logs the five slowest repositories.
+
+### RTR
+
+- New `rtr.trusted` / `rtr.trusted-max-conns`: your own routers' prefixes are
+  always allowed and counted apart from other clients (status `trusted`).
+- Other clients: at most 16 connections per IPv6 /48, and a full set at most
+  twice a minute per address (reconnecting no longer gets around the limit).
+- A failed TLS handshake now frees its connection slot.
+- During a seamless upgrade, a client that does not read its answer is closed
+  after 1 minute instead of blocking the upgrade.
+- RTR full sets and deltas are sent in a fixed order.
+- `-rtr-stdio`: if the router closes only its sending side, the response is
+  still passed through to the end.
+
+### HTTP API
+
+- Public clients: at most 8 connections per address and 224 in total (32 kept
+  for internal clients); a response that cannot send 256 KiB within 60 s is cut.
+- Public `/api/v1/as/{AS}`: at most once a second per client (429 otherwise).
+- `/json-delta`: a 404 body says why (missing `session` / `serial`, session
+  mismatch, range not in history). `/api/v1/vrps/delta` uses a fixed order.
+
+### Operations
+
+- Configuration file: `#` inside double quotes is not a comment, and quotes
+  around a value are removed.
+- At start-up the state directory is set to 0750 and the lock file to 0600, so
+  other accounts cannot hold the lock.
+
 ## 0.2.0 (2026-11)
 
 Fixes from a full code review, preparation for access from the Internet, and

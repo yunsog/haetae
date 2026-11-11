@@ -329,23 +329,19 @@ func TestJSONDeltaTo(t *testing.T) {
 	if code, _ := get(t, h, "GET", "/json-delta?session=7&serial=5&to=1", ""); code != 404 {
 		t.Errorf("bad range code %d", code)
 	}
+	// session 을 빠뜨리거나 다르면 404 그대로, 본문에 원인
+	for q, want := range map[string]string{
+		"/json-delta?serial=0&to=1":           "to needs session",
+		"/json-delta?session=8&serial=0&to=1": "does not match current session 7",
+	} {
+		rr := httptest.NewRecorder()
+		h.ServeHTTP(rr, httptest.NewRequest("GET", q, nil))
+		if rr.Code != 404 || !strings.Contains(rr.Body.String(), want) {
+			t.Errorf("%s: %d %q", q, rr.Code, rr.Body.String())
+		}
+	}
 	if code, _ := get(t, h, "GET", "/json-delta?to=9", ""); code != 400 {
 		t.Errorf("to > serial code %d", code)
-	}
-}
-
-func TestSaveLoadDeltas(t *testing.T) {
-	d := testDaemon(t)
-	p := d.cfg.StateDir + "/deltas.gob"
-	if err := saveDeltas(p, d.st); err != nil {
-		t.Fatal(err)
-	}
-	hist, err := loadDeltas(p, 7, 1)
-	if err != nil || len(hist) != 1 || len(hist[0].AnnVRP) != 1 {
-		t.Fatalf("load: %v %v", hist, err)
-	}
-	if _, err := loadDeltas(p, 8, 1); err == nil {
-		t.Error("other session accepted")
 	}
 }
 

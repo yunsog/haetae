@@ -525,12 +525,12 @@ func (hs *handoverState) resumeRTR(d *daemon, have bool) {
 			log.Printf("handover: rtr %s : %v", s.Remote, err)
 			continue
 		}
-		key := clientKey(s.Remote)
-		if !d.rtr.take(key) { // 상한을 줄인 설정 (재시작과 같은 결과)
+		slot, ok := d.rtr.take(s.Remote)
+		if !ok { // 상한을 줄인 설정 (재시작과 같은 결과)
 			c.Close()
 			continue
 		}
-		rc := &rtrConn{srv: d.rtr, c: c, remote: s.Remote, key: key, trans: s.Trans, w: bufio.NewWriterSize(c, 64*1024),
+		rc := &rtrConn{srv: d.rtr, c: c, remote: s.Remote, slot: slot, trans: s.Trans, w: bufio.NewWriterSize(c, 64*1024),
 			since: s.Since, lastFull: s.LastFull, pending: s.Pending, resumed: true}
 		rc.ver.Store(s.Ver)
 		rc.lastQ.Store(s.LastQ)

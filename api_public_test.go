@@ -4,12 +4,17 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
 	"net"
+	"net/http"
 	"net/http/httptest"
 	"net/netip"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -89,6 +94,20 @@ func TestHTTPPublicAccess(t *testing.T) {
 		}
 	}
 
+	// 공개 쪽 /api/v1/as : 주소마다 1 초에 한 번 (위에서 한 번 부름), 내부는 제한 없음 (11-05 검토 15)
+	if rec := call("203.0.113.9:3000", "/api/v1/as/AS13335"); rec.Code != 429 {
+		t.Errorf("public as again: %d", rec.Code)
+	}
+	for i := 0; i < 2; i++ {
+		if rec := call(inside, "/api/v1/as/AS13335"); rec.Code != 200 {
+			t.Errorf("inside as %d: %d", i, rec.Code)
+		}
+	}
+	time.Sleep(publicQueryEvery)
+	if rec := call(outside, "/api/v1/as/AS13335"); rec.Code != 200 {
+		t.Errorf("public as after wait: %d", rec.Code)
+	}
+
 	// 공개 목록이 비면 밖은 403 (지금까지와 같음)
 	none := []netip.Prefix{}
 	d.httpPub.Store(&none)
@@ -116,7 +135,7 @@ func TestLimitListener(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	l := newLimitListener(ln, 1, nil)
+	l := newLimitListener(ln, 1, nil, func(netip.Addr) bool { return true })
 	defer l.Close()
 	got := make(chan net.Conn, 2)
 	go func() {
@@ -145,5 +164,132 @@ func TestLimitListener(t *testing.T) {
 		s2.Close()
 	case <-time.After(2 * time.Second):
 		t.Fatal("second not accepted after first closed")
+	}
+}
+
+// 공개 쪽 상한 (11-05 검토 5) : 주소마다 maxHTTPPerClient 개, 넘는 연결은 바로 닫힘. trusted 는 세지 않음
+func TestLimitListenerPerClient(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var trusted atomic.Bool
+	l := newLimitListener(ln, maxHTTPConns, nil, func(netip.Addr) bool { return trusted.Load() })
+	defer l.Close()
+	got := make(chan net.Conn, 64)
+	go func() {
+		for {
+			c, err := l.Accept()
+			if err != nil {
+				return
+			}
+			got <- c
+		}
+	}()
+	dial := func() net.Conn {
+		c, err := net.Dial("tcp", ln.Addr().String())
+		if err != nil {
+			t.Fatal(err)
+		}
+		return c
+	}
+	var held []net.Conn
+	for i := 0; i < maxHTTPPerClient; i++ {
+		held = append(held, dial())
+		held = append(held, <-got)
+	}
+	// 9 번째 : 서버가 바로 닫음 (읽으면 EOF)
+	c := dial()
+	c.SetReadDeadline(time.Now().Add(2 * time.Second))
+	if _, err := c.Read(make([]byte, 1)); err == nil || errors.Is(err, os.ErrDeadlineExceeded) {
+		t.Errorf("over per-client: read err %v, want closed", err)
+	}
+	c.Close()
+	// 내부 (trusted) 는 상한 밖
+	trusted.Store(true)
+	c2 := dial()
+	select {
+	case s := <-got:
+		s.Close()
+	case <-time.After(2 * time.Second):
+		t.Error("trusted not accepted")
+	}
+	c2.Close()
+	trusted.Store(false)
+	// 하나 닫으면 다시 자리
+	held[1].Close()
+	time.Sleep(50 * time.Millisecond)
+	c3 := dial()
+	select {
+	case s := <-got:
+		s.Close()
+	case <-time.After(2 * time.Second):
+		t.Error("not accepted after one closed")
+	}
+	c3.Close()
+	for _, h := range held {
+		h.Close()
+	}
+}
+
+// 응답을 읽지 않는 연결은 쓰기 기한으로 끊김, 읽는 연결은 기한이 조각마다 늘어나 끝까지 받음
+func TestWriteProgress(t *testing.T) {
+	old := httpWriteIdle
+	httpWriteIdle = 300 * time.Millisecond
+	defer func() { httpWriteIdle = old }()
+	big := strings.Repeat("x", 64*httpWriteChunk) // 16 MB : 소켓 버퍼보다 큼
+	werr := make(chan error, 4)
+	srv := httptest.NewServer(writeProgress(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, err := w.Write([]byte(big))
+		werr <- err
+	})))
+	defer srv.Close()
+
+	// 읽는 쪽 : 전부 받음 (전체 시간이 기한보다 길어도)
+	resp, err := http.Get(srv.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if len(b) != len(big) || <-werr != nil {
+		t.Fatalf("reader got %d bytes", len(b))
+	}
+	// 읽지 않는 쪽 : 서버 쓰기가 기한으로 실패
+	c, err := net.Dial("tcp", srv.Listener.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	c.(*net.TCPConn).SetReadBuffer(4096)
+	c.Write([]byte("GET / HTTP/1.1\r\nHost: x\r\n\r\n"))
+	select {
+	case err := <-werr:
+		if err == nil {
+			t.Error("non-reader: write succeeded")
+		}
+	case <-time.After(5 * time.Second):
+		t.Error("non-reader: write not cut")
+	}
+}
+
+// clientWaitEvery : 종류마다 간격이 달라도 정리가 긴 쪽 기록을 지우지 않음 (표에 "다시 되는 시각" 을 둠)
+func TestClientWaitMixed(t *testing.T) {
+	d := testDaemon(t)
+	if d.clientWaitEvery("long", "192.0.2.1:1", time.Hour) != 0 {
+		t.Fatal("first long refused")
+	}
+	d.fullSweep = time.Now()    // 채우는 동안은 정리 안 함 (1 초에 한 번)
+	for i := 0; i < 1100; i++ { // 표를 1000 개 넘게 채우고 짧은 것만 지나가게
+		d.clientWaitEvery("short", fmt.Sprintf("198.51.%d.%d:1", i/256, i%256), time.Millisecond)
+	}
+	time.Sleep(5 * time.Millisecond)
+	d.fullSweep = time.Time{}
+	d.clientWaitEvery("short", "203.0.113.1:1", time.Millisecond) // 정리가 돎
+	if len(d.fullLast) > 10 {
+		t.Errorf("short entries left: %d", len(d.fullLast))
+	}
+	if d.clientWaitEvery("long", "192.0.2.1:1", time.Hour) == 0 {
+		t.Error("long entry swept by short interval")
 	}
 }

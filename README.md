@@ -9,7 +9,7 @@ result to routers over RTR and to other systems over an HTTP API.
 The name comes from the *haetae* (해태), a mythical guardian in Korean tradition
 that tells right from wrong. This one checks whether a route is telling the truth.
 
-Haetae 0.2.0 runs in a test deployment alongside other RPs, serving a test router
+Haetae 0.3.0 runs in a test deployment alongside other RPs, serving a test router
 over RTR. It is new software: please run it next to an established RP and compare
 before relying on it.
 
@@ -42,6 +42,21 @@ before relying on it.
 
 On the same repository snapshot and validation time, Haetae and rpki-client 9.0
 produce the same VRPs, ASPA and router keys.
+
+## Download
+
+Each [release](https://github.com/yunsog/haetae/releases) has static Linux
+binaries for amd64 and arm64 (no dependencies, the TALs are built in):
+
+```
+curl -LO https://github.com/yunsog/haetae/releases/download/v0.3.0/haetae-0.3.0-linux-amd64
+curl -LO https://github.com/yunsog/haetae/releases/download/v0.3.0/SHA256SUMS
+sha256sum -c --ignore-missing SHA256SUMS
+install -m 755 haetae-0.3.0-linux-amd64 haetae
+```
+
+Haetae uses the `rsync` command as a fallback when RRDP fails (or set
+`fetch.rsync = false`). A full validation needs about 8 GB of memory.
 
 ## Build
 

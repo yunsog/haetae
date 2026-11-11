@@ -106,7 +106,7 @@ func TestHandoverExec(t *testing.T) {
 	logf, _ := os.Create(logPath)
 	defer logf.Close()
 	cmd := exec.Command(bin, "-c", conf, "-cache", filepath.Join(dir, "cache"), "-o", filepath.Join(dir, "out"), "-state", state,
-		"-tal", talDir, "-norsync", "-interval", "1h", "-rtr", rtrAddr, "-rtr-allow", "127.0.0.1", "-http", httpAddr, "-http-allow", "127.0.0.1")
+		"-tal", talDir, "-norsync", "-interval", "1h", "-rtr", rtrAddr, "-rtr-allow", "127.0.0.1", "-rtr-trusted", "127.0.0.1", "-http", httpAddr, "-http-allow", "127.0.0.1")
 	cmd.Stdout, cmd.Stderr = logf, logf
 	if err := cmd.Start(); err != nil {
 		t.Fatal(err)

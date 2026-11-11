@@ -138,7 +138,7 @@ func newHTTPClient() *http.Client {
 			if len(via) >= 3 {
 				return errors.New("too many redirects")
 			}
-			if req.URL.Scheme != "https" || req.URL.Host != via[0].URL.Host {
+			if req.URL.Scheme != "https" || !sameHost(req.URL, via[0].URL) {
 				return fmt.Errorf("redirect to other host / scheme %s", req.URL)
 			}
 			return nil
@@ -227,7 +227,7 @@ func parseRetryAfter(v string) time.Duration {
 func sameOrigin(notify, u string) bool {
 	a, err1 := url.Parse(notify)
 	b, err2 := url.Parse(u)
-	return err1 == nil && err2 == nil && b.Scheme == "https" && a.Host == b.Host
+	return err1 == nil && err2 == nil && b.Scheme == "https" && sameHost(a, b)
 }
 
 func validHash(h string) bool {
@@ -442,12 +442,15 @@ func parseRRDPFile(path, kind, session string, serial uint64, dir string, fn fun
 		return 0, err
 	}
 	defer fh.Close()
-	// encoding/xml 은 글자 덩어리 (publish 의 base64) 를 통째로 메모리에 올린 뒤 돌려줌 -> 읽기 단계에서 길이를 막음
-	d := newXMLDecoder(&textRunLimit{r: fh, max: maxTextRun})
+	// encoding/xml 은 토큰 (글자 덩어리, 주석, CDATA ...) 하나를 통째로 메모리에 올린 뒤 돌려줌
+	// -> 토큰마다 읽을 수 있는 바이트에 상한 (lim.reset), publish 는 글자 합에 상한 (readRRDPText)
+	lim := &tokenLimit{r: fh, max: maxTextRun}
+	d := newXMLDecoder(lim)
 
 	count := 0
 	sawRoot := false
 	for {
+		lim.reset()
 		tok, err := d.Token()
 		if err == io.EOF {
 			break
@@ -470,13 +473,9 @@ func parseRRDPFile(path, kind, session string, serial uint64, dir string, fn fun
 			sawRoot = true
 			continue
 		}
-		var el struct {
-			URI  string `xml:"uri,attr"`
-			Hash string `xml:"hash,attr"`
-			Data string `xml:",chardata"`
-		}
-		if err := d.DecodeElement(&el, &se); err != nil {
-			return count, fmt.Errorf("XML element: %w", err)
+		el := struct{ URI, Hash, Data string }{URI: attr(se, "uri"), Hash: attr(se, "hash")}
+		if el.Data, err = readRRDPText(d, lim, maxTextRun); err != nil {
+			return count, fmt.Errorf("XML element %s: %w", se.Name.Local, err)
 		}
 		if count++; count > maxRRDPFiles {
 			return count, fmt.Errorf("too many files")
@@ -585,26 +584,54 @@ func applyDeltaFile(path, session string, serial uint64, dir string) (count int,
 	return count, false, nil
 }
 
-// maxTextRun : XML 안에서 '<' 없이 이어지는 글자 수 상한 = publish 하나의 base64 (객체 상한의 4/3) + 줄바꿈 / 공백 여유
+// maxTextRun : publish 하나의 글자 수 상한 = base64 (객체 상한의 4/3) + 줄바꿈 / 공백 여유. XML 토큰 하나의 바이트 상한도 이 값
 const maxTextRun = maxObjectSize/3*4*2 + 1<<20
 
-// textRunLimit : '<' 없이 max 바이트 넘게 이어지면 오류 (XML 해석 전에 거대한 요소 하나로 메모리가 터지는 것을 막음)
-type textRunLimit struct {
-	r   io.Reader
-	max int
-	run int // 마지막 '<' 뒤로 읽은 바이트 수
+// tokenLimit : XML 토큰 하나를 읽는 동안 max 바이트 넘게 읽으면 오류 (reset 으로 다시 셈)
+// 전 방식 (textRunLimit = '<' 없이 이어지는 길이) 은 주석 / CDATA 안에 '<' 를 넣거나 글자를 <!----> 로 잘게 나누면
+// 우회됨 (11-05 검토 2). 토큰 종류와 상관없이 decoder 가 한 번에 메모리에 올리는 양을 막음
+type tokenLimit struct {
+	r    io.Reader
+	max  int
+	left int
 }
 
-func (t *textRunLimit) Read(p []byte) (int, error) {
+func (t *tokenLimit) reset() { t.left = t.max }
+
+func (t *tokenLimit) Read(p []byte) (int, error) {
+	if t.left <= 0 {
+		return 0, fmt.Errorf("XML token longer than %d bytes", t.max)
+	}
+	if len(p) > t.left {
+		p = p[:t.left]
+	}
 	n, err := t.r.Read(p)
-	for _, c := range p[:n] {
-		if c == '<' {
-			t.run = 0
-		} else if t.run++; t.run > t.max {
-			return 0, fmt.Errorf("XML text longer than %d bytes", t.max)
+	t.left -= n
+	return n, err
+}
+
+// readRRDPText : publish / withdraw 의 시작 태그 뒤부터 끝 태그까지 글자를 모음 (합이 max 넘으면 오류)
+// 자식 요소는 오류, 주석 / 처리 명령은 건너뜀 (CDATA 는 글자로 셈)
+func readRRDPText(d *xml.Decoder, lim *tokenLimit, max int) (string, error) {
+	var sb strings.Builder
+	for {
+		lim.reset()
+		tok, err := d.Token()
+		if err != nil {
+			return "", err
+		}
+		switch t := tok.(type) {
+		case xml.CharData:
+			if sb.Len()+len(t) > max {
+				return "", fmt.Errorf("XML text longer than %d bytes", max)
+			}
+			sb.Write(t)
+		case xml.StartElement:
+			return "", fmt.Errorf("unexpected child element %s", t.Name.Local)
+		case xml.EndElement:
+			return sb.String(), nil
 		}
 	}
-	return n, err
 }
 
 // newXMLDecoder : encoding 선언이 US-ASCII / UTF-8 / ISO-8859-1 이어도 받음

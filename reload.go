@@ -41,6 +41,7 @@ var confFields = []confField{
 	{"paths.slurm", false, func(c *daemonConfig) string { return c.SLURM }},
 	{"fetch.interval", false, func(c *daemonConfig) string { return str(c.Interval) }},
 	{"fetch.jobs", false, func(c *daemonConfig) string { return str(c.FetchJobs) }},
+	{"fetch.deadline", false, func(c *daemonConfig) string { return str(c.FetchDeadline) }},
 	{"fetch.rsync", false, func(c *daemonConfig) string { return str(!c.NoRsync) }},
 	{"validation.workers", false, func(c *daemonConfig) string { return str(c.Workers) }},
 	{"validation.drop-warn", false, func(c *daemonConfig) string { return str(c.DropWarn) }},
@@ -49,6 +50,8 @@ var confFields = []confField{
 	{"validation.stale-warn", false, func(c *daemonConfig) string { return str(c.StaleWarn) }},
 	{"rtr.max-conns", false, func(c *daemonConfig) string { return str(c.RTRMaxConns) }},
 	{"rtr.max-per-ip", false, func(c *daemonConfig) string { return str(c.RTRMaxPerIP) }},
+	{"rtr.trusted", false, func(c *daemonConfig) string { return strings.Join(c.RTRTrusted, ",") }},
+	{"rtr.trusted-max-conns", false, func(c *daemonConfig) string { return str(c.RTRTrustedMax) }},
 	{"rtr.stale-close", false, func(c *daemonConfig) string { return str(c.StaleClose) }},
 	{"rtr.listen", true, func(c *daemonConfig) string { return c.RTRAddr }},
 	{"rtr.allow", false, func(c *daemonConfig) string { return strings.Join(c.RTRAllow, ",") }},
@@ -124,6 +127,10 @@ func (d *daemon) reload() error {
 	if err != nil {
 		return reloadFail(fmt.Errorf("rtr.allow %v", err))
 	}
+	rtrTrusted, err := parsePrefixes(nc.RTRTrusted)
+	if err != nil {
+		return reloadFail(fmt.Errorf("rtr.trusted %v", err))
+	}
 	httpAllow, err := parsePrefixes(nc.HTTPAllow)
 	if err != nil {
 		return reloadFail(fmt.Errorf("http.allow %v", err))
@@ -138,7 +145,7 @@ func (d *daemon) reload() error {
 			return reloadFail(fmt.Errorf("rtr-tls %v", err))
 		}
 	}
-	d.applyReload(&nc, old, path, rtrAllow, httpAllow, httpPub, newTLS)
+	d.applyReload(&nc, old, path, rtrAllow, rtrTrusted, httpAllow, httpPub, newTLS)
 	return nil
 }
 
@@ -148,7 +155,7 @@ func reloadFail(err error) error {
 }
 
 // applyReload : 확인이 끝난 새 설정을 적용하고 로그를 남김
-func (d *daemon) applyReload(nc, old *daemonConfig, path string, rtrAllow, httpAllow, httpPub []netip.Prefix, newTLS *tls.Config) {
+func (d *daemon) applyReload(nc, old *daemonConfig, path string, rtrAllow, rtrTrusted, httpAllow, httpPub []netip.Prefix, newTLS *tls.Config) {
 	var changed, restart []string
 	for _, f := range confFields {
 		a, b := f.get(old), f.get(nc)
@@ -172,7 +179,7 @@ func (d *daemon) applyReload(nc, old *daemonConfig, path string, rtrAllow, httpA
 	}
 	dropped := 0
 	if d.rtr != nil {
-		dropped = d.rtr.setLive(rtrAllow, nc.RTRRefresh, nc.RTRRetry, nc.RTRExpire, nc.RTRMaxConns, nc.RTRMaxPerIP)
+		dropped = d.rtr.setLive(rtrAllow, rtrTrusted, nc.RTRRefresh, nc.RTRRetry, nc.RTRExpire, nc.RTRMaxConns, nc.RTRMaxPerIP, nc.RTRTrustedMax)
 	}
 	d.mu.Lock()
 	d.confPath, d.confAt = path, time.Now()

@@ -205,7 +205,7 @@ func parseASIdentifiers(der []byte) (asResources, error) {
 		// RFC 6487 4.8.11 : rdi 금지, asnum 만
 		return res, fmt.Errorf("ASIdentifiers: want asnum [0] only")
 	}
-	inner, err := derChildren(parts[0])
+	inner, err := derChildren(parts[0], 1)
 	if err != nil || len(inner) != 1 {
 		return res, fmt.Errorf("asnum: bad EXPLICIT")
 	}

@@ -29,6 +29,38 @@ ProtectSystem=strict
 ProtectHome=yes
 PrivateTmp=yes
 ReadWritePaths=/var/lib/haetae
+# 더 줄이기 (11-05 검토). systemd-analyze security 8.3 -> 1.5. 넣기 전에 tools/hardening_test.sh (deploy/README.md)
+#   해태 버그로 누가 해태 계정의 코드를 돌리게 되어도 서버의 다른 곳을 건드리지 못하게 하는 마지막 벽
+#   권한 조각 없음 : 포트 3323 / 5002 는 1024 위, TCP-MD5 / AO setsockopt 도 권한 필요 없음
+CapabilityBoundingSet=
+AmbientCapabilities=
+#   장치 / 커널 / cgroup / 시계 / 호스트 이름 : 쓰지 않음 (/dev 는 null, urandom 같은 기본만)
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+#   /proc 은 자기 것만 (메모리 표시 = /proc/self/statm)
+ProtectProc=invisible
+ProcSubset=pid
+#   소켓 : IPv4 / IPv6 (RTR, HTTP, RRDP, rsync) + 유닉스 (systemd 알림 sd_notify)
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+#   쓰기 + 실행 메모리 금지 (주입한 코드 실행 막기). Go / rsync 는 실행 중에 코드를 만들지 않음
+MemoryDenyWriteExecute=yes
+#   시스템 호출은 일반 서비스 목록만 (execve = rsync / 판 올리기, flock, setsockopt 포함). 나머지는 EPERM
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+RemoveIPC=yes
+PrivateIPC=yes
+KeyringMode=private
+#   UMask 는 넣지 않음 : out 은 남도 읽음 (다른 도구가 out/json 을 읽을 수 있음). 잠금 / state 는 해태가 시작 때 0600 / 0750 으로 (daemon.go privateState)
 # 한 회차 실제 사용 (anon) 약 5 GB + 파일 캐시. 8G 면 파일 캐시로 swap 을 씀
 MemoryMax=12G
 # Go 쓰레기 수거 목표 (0.2.0) : 9 GiB 가까이 가면 GC 를 더 자주 돌려 MemoryMax 에 닿지 않게 (넘어도 죽지 않는 부드러운 상한)

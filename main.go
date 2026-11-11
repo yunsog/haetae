@@ -28,8 +28,9 @@ import (
 	"time"
 )
 
-// version : 해태 판 (상태 API, RRDP User-Agent, 공개 저장소 태그 v<판>). 판을 올릴 때 여기 한 곳만 고침
-const version = "0.2.0"
+// version : 해태 판 (상태 API, RRDP User-Agent, /metrics build_info, 공개 저장소 태그 v<판>). 판을 올릴 때 여기 한 곳만 고침.
+// 공개 (태그) 사이에는 다음 판 + "-dev" (11-02 사용자 : 0.2.0 공개 뒤 0.3.0-dev). 태그 때 -dev 를 뗌
+const version = "0.3.0"
 
 // 상주 모드 폴더 기본값 (10-31, 운영 = 전용 계정 haetae). 개발 때는 -cache data/cache -o data/out -state data/state 처럼 직접 줌.
 // -validate 는 기본값을 쓰지 않음 (-cache / -o 필수) : 시험 검증이 운영 캐시를 건드리지 않게
@@ -42,13 +43,13 @@ const (
 // options : 명령줄 옵션 (설정 파일 config.go 도 같은 이름으로 채움)
 type options struct {
 	parse, rscFile, failOut, cacheDir, talDir, outDir                                  *string
-	workers, fetchJobs, rtrMaxConns, rtrMaxPerIP                                       *int
+	workers, fetchJobs, rtrMaxConns, rtrMaxPerIP, rtrTrustedMax                        *int
 	validate, fetch, noRsync, once                                                     *bool
 	evalTime                                                                           *int64
-	stateDir, slurmPath, rtrAddr, rtrAllow, rtrAuth                                    *string
+	stateDir, slurmPath, rtrAddr, rtrAllow, rtrTrusted, rtrAuth                        *string
 	rtrTLS, rtrTLSCert, rtrTLSKey, rtrTLSCA, rtrStdio, httpAddr, httpAllow, httpPublic *string
 	rtrRefresh, rtrRetry, rtrExpire                                                    *uint
-	interval, deltaFull, maxStartAge, staleWarn, staleClose                            *time.Duration
+	interval, deltaFull, maxStartAge, staleWarn, staleClose, fetchDeadline             *time.Duration
 	jsonExt, holdDrop                                                                  *bool
 	dropWarn                                                                           *float64
 	config                                                                             *string
@@ -70,6 +71,7 @@ func defineFlags(f *flag.FlagSet) *options {
 	o.evalTime = f.Int64("P", 0, "검증 시각 (unix 초, 0 = 지금). rpki-client -P 와 같음")
 	o.fetch = f.Bool("fetch", false, "-validate 전에 저장소에서 받음 (RRDP / rsync, -cache 는 이 RP 의 캐시)")
 	o.fetchJobs = f.Int("fetch-j", 32, "동시 수집 저장소 수")
+	o.fetchDeadline = f.Duration("fetch-deadline", 20*time.Minute, "상주 회차의 수집 기한 : 지나면 남은 저장소는 직전 데이터로 (0 = 없음, 그 밖 5m 이상)")
 	o.noRsync = f.Bool("norsync", false, "rsync 대체 안 함")
 
 	// 상주 모드
@@ -83,6 +85,8 @@ func defineFlags(f *flag.FlagSet) *options {
 	o.rtrAuth = f.String("rtr-auth", "", "RTR TCP-MD5 / TCP-AO 키 파일 (줄마다 <주소> md5 <키> | <주소> ao <알고리즘> <sendid> <recvid> <키>)")
 	o.rtrMaxConns = f.Int("rtr-max-conns", 256, "RTR 동시 연결 상한 (0 = 없음)")
 	o.rtrMaxPerIP = f.Int("rtr-max-per-ip", 4, "주소 하나 (IPv6 는 /64) 의 RTR 동시 연결 상한 (0 = 없음)")
+	o.rtrTrusted = f.String("rtr-trusted", "", "운영 라우터 대역 (쉼표) : 늘 허용, 주소당 / 공개 쪽 상한 대신 -rtr-trusted-max-conns 만")
+	o.rtrTrustedMax = f.Int("rtr-trusted-max-conns", 20000, "-rtr-trusted 대역의 RTR 동시 연결 상한 (0 = 없음)")
 	o.rtrRefresh = f.Uint("rtr-refresh", 600, "RTR refresh (초, 1~86400) : 라우터가 Notify 없이도 묻는 간격 (v1 / v2)")
 	o.rtrRetry = f.Uint("rtr-retry", 300, "RTR retry (초, 1~7200) : 끊겼을 때 라우터가 다시 붙는 간격")
 	o.rtrExpire = f.Uint("rtr-expire", 7200, "RTR expire (초, 600~172800, refresh / retry 보다 커야 함) : 이 시간 못 받으면 라우터가 VRP 를 버림")
@@ -172,15 +176,21 @@ func buildDaemonConfig(o *options) (daemonConfig, error) {
 	if *o.rtrMaxConns < 0 || *o.rtrMaxPerIP < 0 || *o.rtrMaxConns > 100000 || *o.rtrMaxPerIP > 1000 {
 		return daemonConfig{}, fmt.Errorf("rtr-max-conns %d (0~100000) / rtr-max-per-ip %d (0~1000)", *o.rtrMaxConns, *o.rtrMaxPerIP)
 	}
+	if *o.fetchDeadline < 0 || (*o.fetchDeadline > 0 && *o.fetchDeadline < 5*time.Minute) {
+		return daemonConfig{}, fmt.Errorf("fetch-deadline %s : 0 (없음) 또는 5m 이상 (저장소 하나 제한 5 분)", *o.fetchDeadline)
+	}
+	if *o.rtrTrustedMax < 0 || *o.rtrTrustedMax > 100000 {
+		return daemonConfig{}, fmt.Errorf("rtr-trusted-max-conns %d (0~100000)", *o.rtrTrustedMax)
+	}
 	if *o.staleWarn < 0 || *o.staleClose < 0 || (*o.staleClose > 0 && *o.staleClose < 30*time.Minute) {
 		return daemonConfig{}, fmt.Errorf("stale-warn %s / stale-close %s : 0 이상, stale-close 는 0 (끔) 또는 30m 이상", *o.staleWarn, *o.staleClose)
 	}
 	return daemonConfig{
 		CacheDir: *o.cacheDir, TALDir: *o.talDir, OutDir: *o.outDir, StateDir: *o.stateDir, SLURM: *o.slurmPath,
-		Interval: *o.interval, Workers: *o.workers, FetchJobs: *o.fetchJobs, NoRsync: *o.noRsync,
-		RTRAddr: *o.rtrAddr, RTRAllow: splitList(*o.rtrAllow), RTRAuth: *o.rtrAuth,
+		Interval: *o.interval, Workers: *o.workers, FetchJobs: *o.fetchJobs, NoRsync: *o.noRsync, FetchDeadline: *o.fetchDeadline,
+		RTRAddr: *o.rtrAddr, RTRAllow: splitList(*o.rtrAllow), RTRTrusted: splitList(*o.rtrTrusted), RTRAuth: *o.rtrAuth,
 		RTRRefresh: uint32(*o.rtrRefresh), RTRRetry: uint32(*o.rtrRetry), RTRExpire: uint32(*o.rtrExpire),
-		RTRMaxConns: *o.rtrMaxConns, RTRMaxPerIP: *o.rtrMaxPerIP,
+		RTRMaxConns: *o.rtrMaxConns, RTRMaxPerIP: *o.rtrMaxPerIP, RTRTrustedMax: *o.rtrTrustedMax,
 		RTRTLSAddr: *o.rtrTLS, RTRTLSCert: *o.rtrTLSCert, RTRTLSKey: *o.rtrTLSKey, RTRTLSCA: *o.rtrTLSCA,
 		HTTPAddr: *o.httpAddr, HTTPAllow: splitList(*o.httpAllow), HTTPPublic: splitList(*o.httpPublic), JSONExt: *o.jsonExt, DeltaFullInterval: *o.deltaFull,
 		MaxStartAge: *o.maxStartAge, DropWarn: *o.dropWarn, HoldOnDrop: *o.holdDrop, StaleWarn: *o.staleWarn, StaleClose: *o.staleClose,

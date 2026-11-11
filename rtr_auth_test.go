@@ -3,6 +3,7 @@ package main
 // rtr_auth_test.go : TCP-MD5 / TCP-AO 키를 넣은 듣기 소켓에 같은 키 / 다른 키 / 키 없이 붙어 봄, TLS RTR
 
 import (
+	"bytes"
 	"context"
 	"crypto/ecdsa"
 	"crypto/elliptic"
@@ -10,7 +11,10 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"encoding/binary"
 	"encoding/pem"
+	"fmt"
+	"io"
 	"log"
 	"math/big"
 	"net"
@@ -191,5 +195,89 @@ func TestRTRTLS(t *testing.T) {
 			t.Errorf("tls without client cert: got data")
 		}
 		c2.Close()
+	}
+}
+
+// -rtr-stdio 중계 : Reset Query 를 보내고 입력을 바로 닫아도 (반쪽 닫기) 응답을 End of Data 까지 받음 (11-04)
+func TestRelayStdioHalfClose(t *testing.T) {
+	var vrps []rtrVRP
+	for i := 0; i < 20000; i++ { // 응답이 소켓 버퍼보다 커야 잘림이 드러남
+		vrps = append(vrps, vr(fmt.Sprintf("10.%d.%d.0/24", i/256, i%256), 24, 65001))
+	}
+	st := &store{Session: 5}
+	st.update(mkSet(vrps, nil))
+	srv := &rtrServer{St: st, Refresh: 600, Retry: 300, Expire: 7200, Logf: log.Printf,
+		Allow: []netip.Prefix{netip.MustParsePrefix("127.0.0.0/8")}}
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	go srv.serve(ln)
+
+	c, err := net.Dial("tcp", ln.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	var out bytes.Buffer
+	done := make(chan struct{})
+	go func() {
+		relayStdio(c, bytes.NewReader(query(1, pduResetQuery, 0, nil)), &out)
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("relay did not finish")
+	}
+	// PDU 를 세어 봄 : Cache Response 1, IPv4 20000, End of Data 1
+	n := map[uint8]int{}
+	b := out.Bytes()
+	for len(b) >= 8 {
+		l := int(binary.BigEndian.Uint32(b[4:8]))
+		if l < 8 || l > len(b) {
+			break
+		}
+		n[b[1]]++
+		b = b[l:]
+	}
+	if n[pduCacheResp] != 1 || n[pduIPv4Prefix] != 20000 || n[pduEndOfData] != 1 || len(b) != 0 {
+		t.Fatalf("got %v, %d bytes left", n, len(b))
+	}
+}
+
+// TLS 인사 실패 : 자리 / 활성 목록 / 연결 수를 돌려줌 (11-05 검토 6 : 전에는 샘 -> 같은 주소 MaxPerIP 번이면 영구 차단)
+func TestRTRTLSHandshakeRelease(t *testing.T) {
+	dir := t.TempDir()
+	sc, sk := testCert(t, dir, "server")
+	cfg, err := rtrTLSConfig(sc, sk, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := &rtrServer{St: &store{Session: 1}, Allow: []netip.Prefix{netip.MustParsePrefix("127.0.0.0/8")}, Logf: t.Logf, MaxPerIP: 1}
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	go srv.serve(tls.NewListener(ln, cfg))
+	for i := 0; i < 3; i++ { // TLS 가 아닌 것을 보냄 = 인사 실패
+		c, err := net.Dial("tcp", ln.Addr().String())
+		if err != nil {
+			t.Fatal(err)
+		}
+		c.Write([]byte("not tls at all, not tls at all\r\n"))
+		c.SetReadDeadline(time.Now().Add(5 * time.Second))
+		io.Copy(io.Discard, c) // 서버가 닫을 때까지
+		c.Close()
+		deadline := time.Now().Add(2 * time.Second)
+		for srv.clients.Load() != 0 && time.Now().Before(deadline) {
+			time.Sleep(10 * time.Millisecond)
+		}
+	}
+	srv.mu.Lock()
+	defer srv.mu.Unlock()
+	if srv.total != 0 || len(srv.perIP) != 0 || len(srv.active) != 0 || srv.clients.Load() != 0 {
+		t.Errorf("leaked: total %d perIP %v active %d clients %d", srv.total, srv.perIP, len(srv.active), srv.clients.Load())
 	}
 }

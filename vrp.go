@@ -10,9 +10,7 @@ package main
 import (
 	"bufio"
 	"bytes"
-	"encoding/base64"
 	"encoding/gob"
-	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"net/netip"
@@ -59,6 +57,9 @@ type payloadSet struct {
 
 	sortOnce sync.Once
 	sorted   []rtrVRP // 정렬된 VRP (json-delta 전체, 처음 쓸 때 만듦)
+
+	asnOnce sync.Once
+	asnIdx  map[uint32][]int32 // ASN -> Full 의 위치 (Full 순서 그대로, /api/v1/as 조회용, 처음 쓸 때 만듦)
 }
 
 // slurmCounts : SLURM 적용 수
@@ -96,6 +97,30 @@ func sortRTRVRPs(vs []rtrVRP) {
 	})
 }
 
+// sortRTRKeys : 라우터 키를 ASN, SKI, SPKI 순으로
+func sortRTRKeys(ks []rtrKey) {
+	sort.Slice(ks, func(i, j int) bool {
+		a, b := ks[i], ks[j]
+		if a.ASN != b.ASN {
+			return a.ASN < b.ASN
+		}
+		if c := bytes.Compare(a.SKI[:], b.SKI[:]); c != 0 {
+			return c < 0
+		}
+		return a.SPKI < b.SPKI
+	})
+}
+
+// sortedKeys : 라우터 키 정렬 목록 (수 개라 부를 때마다 만듦)
+func (p *payloadSet) sortedKeys() []rtrKey {
+	ks := make([]rtrKey, 0, len(p.Keys))
+	for k := range p.Keys {
+		ks = append(ks, k)
+	}
+	sortRTRKeys(ks)
+	return ks
+}
+
 // index : 같은 prefix 의 VRP 묶음 (조회 때 prefix 길이마다 한 번씩 찾음)
 func (p *payloadSet) index() map[netip.Prefix][]rtrVRP {
 	p.idxOnce.Do(func() {
@@ -105,6 +130,21 @@ func (p *payloadSet) index() map[netip.Prefix][]rtrVRP {
 		}
 	})
 	return p.idx
+}
+
+// byASN : 이 ASN 의 VRP (Full 순서). 전에는 요청마다 Full (약 100 만) 을 다 훑음 (11-05 검토 15)
+func (p *payloadSet) byASN(asn uint32) []vrpKey {
+	p.asnOnce.Do(func() {
+		p.asnIdx = map[uint32][]int32{}
+		for i, k := range p.Full {
+			p.asnIdx[k.ASN] = append(p.asnIdx[k.ASN], int32(i))
+		}
+	})
+	out := make([]vrpKey, 0, len(p.asnIdx[asn]))
+	for _, i := range p.asnIdx[asn] {
+		out = append(out, p.Full[i])
+	}
+	return out
 }
 
 // delta : serial 하나만큼의 변화
@@ -391,6 +431,11 @@ func (s *store) netDiffTo(from, to uint32) (ann, wdr []rtrVRP, kAnn, kWdr []rtrK
 	for c := range as {
 		aspaChg = append(aspaChg, c)
 	}
+	// 순서를 고정 (map 순서는 매번 다름 -> 같은 delta 가 매번 다른 순서였음, 11-04). RTR / json-delta / vrps/delta 모두 여기를 지남
+	sortRTRVRPs(ann)
+	sortRTRVRPs(wdr)
+	sortRTRKeys(kAnn)
+	sortRTRKeys(kWdr)
 	sort.Slice(aspaChg, func(i, j int) bool { return aspaChg[i] < aspaChg[j] })
 	return ann, wdr, kAnn, kWdr, aspaChg, true
 }
@@ -508,49 +553,6 @@ func loadSavedState(path string) (*savedState, *payloadSet, error) {
 	return &ss, p, nil
 }
 
-// ---- 0.2.0 전 저장 방식 (payload.gob 이 아직 없을 때 한 번만 씀, 다음 판에서 지움) ----
-
-// savedDeltas : delta 기록 (deltas.gob). 재시작 뒤에도 RTR Serial Query / json-delta 가 이어지게
-type savedDeltas struct {
-	Session uint16
-	Serial  uint32
-	History []delta
-}
-
-// saveDeltas : 0.2.0 전 방식 (지금은 시험만 씀, loadDeltas 확인용)
-func saveDeltas(path string, s *store) error {
-	s.mu.RLock()
-	sd := savedDeltas{s.Session, s.Serial, s.History}
-	var buf bytes.Buffer
-	err := gob.NewEncoder(&buf).Encode(&sd)
-	s.mu.RUnlock()
-	if err != nil {
-		return err
-	}
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, buf.Bytes(), 0644); err != nil {
-		return err
-	}
-	return os.Rename(tmp, path)
-}
-
-// loadDeltas : session / serial 이 지금 상태와 같을 때만 기록을 씀
-func loadDeltas(path string, session uint16, serial uint32) ([]delta, error) {
-	f, err := os.Open(path)
-	if err != nil {
-		return nil, err
-	}
-	defer f.Close()
-	var sd savedDeltas
-	if err := gob.NewDecoder(f).Decode(&sd); err != nil {
-		return nil, err
-	}
-	if sd.Session != session || sd.Serial != serial {
-		return nil, fmt.Errorf("session / serial %d / %d differs from state %d / %d", sd.Session, sd.Serial, session, serial)
-	}
-	return sd.History, nil
-}
-
 // rtrState : session / serial (state.json)
 type rtrState struct {
 	Session uint16    `json:"session"`
@@ -568,86 +570,4 @@ func saveRTRState(path string, s *store) error {
 		return err
 	}
 	return os.Rename(tmp, path)
-}
-
-func loadRTRState(path string) (*rtrState, error) {
-	b, err := os.ReadFile(path)
-	if err != nil {
-		return nil, err
-	}
-	var st rtrState
-	return &st, json.Unmarshal(b, &st)
-}
-
-// loadPayloadJSON : 직전 출력 json (output.go 형식) 에서 payloadSet 복원 (재시작 빠른 시작, C3)
-func loadPayloadJSON(path string) (*payloadSet, error) {
-	b, err := os.ReadFile(path)
-	if err != nil {
-		return nil, err
-	}
-	var j struct {
-		Metadata struct {
-			Evaltime string `json:"evaltime"`
-		} `json:"metadata"`
-		Roas []struct {
-			ASN       uint32 `json:"asn"`
-			Prefix    string `json:"prefix"`
-			MaxLength int    `json:"maxLength"`
-			TA        string `json:"ta"`
-			Expires   int64  `json:"expires"`
-		} `json:"roas"`
-		Aspas []struct {
-			Customer  uint32   `json:"customer_asid"`
-			Providers []uint32 `json:"providers"`
-		} `json:"aspas"`
-		Keys []struct {
-			ASN    uint32 `json:"asn"`
-			SKI    string `json:"ski"`
-			Pubkey string `json:"pubkey"`
-		} `json:"bgpsec_keys"`
-	}
-	if err := json.Unmarshal(b, &j); err != nil {
-		return nil, err
-	}
-	built, err := time.Parse("2006-01-02T15:04:05Z", j.Metadata.Evaltime)
-	if err != nil {
-		return nil, fmt.Errorf("evaltime: %w", err)
-	}
-	p := &payloadSet{VRPs: map[rtrVRP]bool{}, Keys: map[rtrKey]bool{}, ASPAs: map[uint32][]uint32{},
-		FullExp: map[vrpKey]time.Time{}, Built: built}
-	for _, r := range j.Roas {
-		pf, err := netip.ParsePrefix(r.Prefix)
-		if err != nil {
-			return nil, err
-		}
-		k := vrpKey{r.ASN, pf, r.MaxLength, r.TA}
-		p.Full = append(p.Full, k)
-		p.FullExp[k] = time.Unix(r.Expires, 0)
-		p.VRPs[rtrVRP{pf, uint8(r.MaxLength), r.ASN}] = true
-	}
-	for _, a := range j.Aspas {
-		m := map[uint32]bool{}
-		for _, x := range p.ASPAs[a.Customer] {
-			m[x] = true
-		}
-		for _, x := range a.Providers {
-			m[x] = true
-		}
-		p.ASPAs[a.Customer] = sortedASNs(m)
-	}
-	for _, r := range j.Keys {
-		var k rtrKey
-		ski, err := hex.DecodeString(r.SKI)
-		if err != nil || len(ski) != 20 {
-			return nil, fmt.Errorf("bad ski")
-		}
-		spki, err := base64.StdEncoding.DecodeString(r.Pubkey)
-		if err != nil {
-			return nil, err
-		}
-		copy(k.SKI[:], ski)
-		k.ASN, k.SPKI = r.ASN, string(spki)
-		p.Keys[k] = true
-	}
-	return p, nil
 }

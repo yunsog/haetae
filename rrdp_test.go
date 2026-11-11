@@ -78,8 +78,26 @@ func TestDeltaTwoPhase(t *testing.T) {
 func TestRRDPHugeElement(t *testing.T) {
 	huge := writeDelta(t, `<publish uri="rsync://h/m/big.roa">`+strings.Repeat("A", maxTextRun+10)+`</publish>`)
 	_, _, err := applyDeltaFile(huge, "s", 2, t.TempDir())
-	if err == nil || !strings.Contains(err.Error(), "XML text longer") {
+	if err == nil || !strings.Contains(err.Error(), "longer than") {
 		t.Fatalf("err = %v", err)
+	}
+	// 우회 (11-05 검토 2) : 글자를 주석으로 잘게 나눔, CDATA / 주석 안에 '<', 자식 요소
+	chunk := strings.Repeat("A", 1<<20)
+	split := strings.Repeat(chunk+"<!---->", maxTextRun/(1<<20)+2)
+	lt := strings.Repeat("AAAA<", maxTextRun/5+10000) // decoder 가 미리 읽는 4 KB 만큼은 넘을 수 있음
+	for name, body := range map[string]string{
+		"comment split":  split,
+		"cdata with <":   "<![CDATA[" + lt + "]]>",
+		"comment with <": "<!--" + lt + "-->",
+	} {
+		f := writeDelta(t, `<publish uri="rsync://h/m/big.roa">`+body+`</publish>`)
+		if _, _, err := applyDeltaFile(f, "s", 2, t.TempDir()); err == nil || !strings.Contains(err.Error(), "longer than") {
+			t.Errorf("%s: err = %v", name, err)
+		}
+	}
+	child := writeDelta(t, `<publish uri="rsync://h/m/a.roa">QQ==<x/></publish>`)
+	if _, _, err := applyDeltaFile(child, "s", 2, t.TempDir()); err == nil || !strings.Contains(err.Error(), "child element") {
+		t.Errorf("child: err = %v", err)
 	}
 	// 상한 안의 보통 객체는 그대로 됨
 	ok := writeDelta(t, `<publish uri="rsync://h/m/a.roa">`+base64.StdEncoding.EncodeToString([]byte("x"))+`</publish>`)

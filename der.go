@@ -119,14 +119,19 @@ func derOne(b []byte) (derNode, error) {
 	return n, nil
 }
 
-// derChildren : constructed TLV 의 자식 목록
-func derChildren(n derNode) ([]derNode, error) {
+// derChildren : constructed TLV 의 자식 목록 (최대 max 개)
+// 상한은 담으면서 봄 : 다 담은 뒤에 세면 2 바이트 원소 (빈 SEQUENCE) 가 derNode 72 바이트가 되어
+// 20 MB 객체 하나가 서명 확인 전에 수 GB 를 씀 (11-05 검토 1)
+func derChildren(n derNode, max int) ([]derNode, error) {
 	if !n.Constructed {
 		return nil, derErr("not constructed (tag %d)", n.Tag)
 	}
 	var out []derNode
 	b := n.Body
 	for len(b) > 0 {
+		if len(out) >= max {
+			return nil, derErr("more than %d items", max)
+		}
 		c, rest, err := derRead(b)
 		if err != nil {
 			return nil, err
@@ -152,11 +157,11 @@ func derSeq(n derNode, min, max int) ([]derNode, error) {
 	if !n.is(tagSequence) || !n.Constructed {
 		return nil, derErr("want SEQUENCE, got class %d tag %d", n.Class, n.Tag)
 	}
-	c, err := derChildren(n)
+	c, err := derChildren(n, max)
 	if err != nil {
 		return nil, err
 	}
-	if len(c) < min || len(c) > max {
+	if len(c) < min {
 		return nil, derErr("SEQUENCE has %d items, want %d..%d", len(c), min, max)
 	}
 	return c, nil

@@ -90,7 +90,7 @@ func parseSignedObjectOpt(der []byte, want asn1.ObjectIdentifier, eeNoSIA bool) 
 	if !sd[3].isCtx(0) || !sd[3].Constructed {
 		return nil, fmt.Errorf("SignedData: certificates missing")
 	}
-	certs, err := derChildren(sd[3])
+	certs, err := derChildren(sd[3], 1)
 	if err != nil || len(certs) != 1 {
 		return nil, fmt.Errorf("SignedData: want exactly 1 certificate")
 	}
@@ -102,7 +102,7 @@ func parseSignedObjectOpt(der []byte, want asn1.ObjectIdentifier, eeNoSIA bool) 
 	if !sd[4].is(tagSet) || !sd[4].Constructed {
 		return nil, fmt.Errorf("SignedData: signerInfos not SET")
 	}
-	sis, err := derChildren(sd[4])
+	sis, err := derChildren(sd[4], 1)
 	if err != nil || len(sis) != 1 {
 		return nil, fmt.Errorf("SignedData: want exactly 1 SignerInfo")
 	}
@@ -137,7 +137,7 @@ func checkDigestAlgs(n derNode) error {
 	if !n.is(tagSet) || !n.Constructed {
 		return fmt.Errorf("digestAlgorithms not SET")
 	}
-	algs, err := derChildren(n)
+	algs, err := derChildren(n, 1)
 	if err != nil || len(algs) != 1 {
 		return fmt.Errorf("digestAlgorithms: want 1")
 	}
@@ -230,7 +230,7 @@ func (so *signedObject) checkSignerInfo(n derNode) error {
 // parseSignedAttrs : contentType (필수) + messageDigest (필수) + signingTime / binarySigningTime (선택)
 // 그 외 속성, 중복, 값 여러 개는 거부. messageDigest 값을 돌려줌
 func (so *signedObject) parseSignedAttrs(n derNode) ([]byte, error) {
-	attrs, err := derChildren(n)
+	attrs, err := derChildren(n, 4) // 속성 종류가 4 개뿐 (중복은 아래에서 거부)
 	if err != nil {
 		return nil, err
 	}
@@ -252,7 +252,7 @@ func (so *signedObject) parseSignedAttrs(n derNode) ([]byte, error) {
 		if !f[1].is(tagSet) || !f[1].Constructed {
 			return nil, fmt.Errorf("signedAttr values not SET")
 		}
-		vals, err := derChildren(f[1])
+		vals, err := derChildren(f[1], 1)
 		if err != nil || len(vals) != 1 {
 			return nil, fmt.Errorf("signedAttr %s: want 1 value", oid)
 		}

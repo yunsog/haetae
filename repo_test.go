@@ -153,3 +153,19 @@ func TestFallbackAfterLarge(t *testing.T) {
 		t.Errorf("status %+v", st)
 	}
 }
+
+// 느린 저장소 로그 : 긴 순, n 개, 1 초 안 되는 것은 뺌
+func TestSlowestRepos(t *testing.T) {
+	rs := []repoStatus{
+		{URI: "a", Type: "rrdp", Result: "ok", Duration: 2 * time.Second},
+		{URI: "b", Type: "rrdp", Result: "failed", Duration: 300 * time.Second},
+		{URI: "c", Type: "rsync", Result: "ok", Duration: 500 * time.Millisecond},
+		{URI: "d", Type: "rrdp", Result: "ok", Duration: 40 * time.Second},
+	}
+	if s := slowestRepos(rs, 2); s != "b rrdp failed 5m0s, d rrdp ok 40s" {
+		t.Errorf("got %q", s)
+	}
+	if s := slowestRepos(rs[2:3], 5); !strings.HasPrefix(s, "(none") {
+		t.Errorf("got %q", s)
+	}
+}

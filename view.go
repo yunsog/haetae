@@ -12,6 +12,7 @@ import (
 	"net/netip"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -153,6 +154,30 @@ type queryView struct {
 	RKeys   []routerKeyOut
 	Unsafe  []unsafeVRP
 	Repos   []repoStatus
+
+	aspaOnce sync.Once
+	aspaObj  map[uint32][]int // customer ASN -> Objects 의 위치 (valid ASPA, URI 순, 처음 쓸 때 만듦)
+}
+
+// aspaObjects : 이 customer 의 valid ASPA 객체 (URI 순). 전에는 요청마다 Objects (약 57 만) 를 다 훑음 (11-05 검토 15)
+func (q *queryView) aspaObjects(asn uint32) []*objInfo {
+	q.aspaOnce.Do(func() {
+		q.aspaObj = map[uint32][]int{}
+		for i := range q.Objects {
+			o := &q.Objects[i]
+			if o.Type != "asa" || o.Status != "valid" {
+				continue
+			}
+			if as := objASNs(o); len(as) == 1 {
+				q.aspaObj[as[0]] = append(q.aspaObj[as[0]], i)
+			}
+		}
+	})
+	var out []*objInfo
+	for _, i := range q.aspaObj[asn] {
+		out = append(out, &q.Objects[i])
+	}
+	return out
 }
 
 // newQueryView : writeOutputs 뒤에 부름 (objects 가 URI 순이어야 함)

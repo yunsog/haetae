@@ -60,7 +60,16 @@ const (
 	rtrFirstQuery = 30 * time.Second // 붙은 뒤 첫 PDU 까지 (라우터는 바로 Reset / Serial Query 를 보냄)
 	rtrIdle       = 2 * time.Hour    // 그 뒤 PDU 없이 이만큼이면 끊음 (라우터는 refresh 마다 Serial Query, 보통 10 분 ~ 1 시간)
 	rtrFullEvery  = time.Minute      // 연결 하나가 전체 (Reset Query 응답, 약 100 만 VRP) 를 받는 최소 간격
+	// 공개 쪽 주소 하나 (clientKey) 가 rtrFullEvery 안에 받는 전체 수 (11-05 검토 7 : 연결마다만 세면 다시 붙어서 피함).
+	// 2 = RSP 두 장이 각자 세션을 여는 장비 (ASR 9000 NSR 등) 가 동시에 Reset. trusted 는 세지 않음 (자사 라우터, SSH 는 모두 127.0.0.1)
+	rtrFullPerClient = 2
+	// 공개 쪽 IPv6 /48 하나의 동시 연결 상한 (11-05 검토 8 : /64 마다 4 개로는 /48 하나가 /64 를 바꿔 가며 자리를 다 채움)
+	rtrMaxPer48 = 16
 )
+
+// rtrPauseWrite : 판 올리기 때 쓰는 중인 연결에 주는 쓰기 시간 (11-05 검토 9 : 응답을 읽지 않는 클라이언트 하나가
+// 판 올리기를 막음). handoverParkWait (2 분) 보다 짧게. 정상 라우터의 전체 전송은 약 20 초. 시험에서 줄임
+var rtrPauseWrite = time.Minute
 
 type rtrServer struct {
 	St      *store
@@ -71,18 +80,28 @@ type rtrServer struct {
 	Expire  uint32
 	Logf    func(string, ...any)
 
-	MaxConns int // 동시 연결 상한 (0 = 제한 없음, 시험용)
-	MaxPerIP int // 주소 하나 (IPv6 는 /64) 의 동시 연결 상한 (0 = 제한 없음)
+	MaxConns int // 공개 쪽 동시 연결 상한 (0 = 제한 없음, 시험용)
+	MaxPerIP int // 공개 쪽 주소 하나 (IPv6 는 /64) 의 동시 연결 상한 (0 = 제한 없음). IPv6 /48 은 rtrMaxPer48
 
-	cmu sync.RWMutex // Allow / Refresh / Retry / Expire / MaxConns / MaxPerIP 보호 (systemctl reload 로 바뀜, setLive)
+	// Trusted : 운영 라우터 대역 (rtr.trusted, 11-05). 허용 목록과 별개로 언제나 허용, 주소당 / 공개 쪽 상한을 받지 않고
+	// TrustedMax (0 = 제한 없음) 만. 라우터 loopback 이 /128 로 같은 /64 에 수천 대여도 됨 = 공개 쪽이 자리를 다 채워도 붙음
+	Trusted    []netip.Prefix
+	TrustedMax int
+
+	cmu sync.RWMutex // Allow / Trusted / Refresh / Retry / Expire / 상한 보호 (systemctl reload 로 바뀜, setLive)
 
 	clients atomic.Int64
 	mu      sync.Mutex
 	active  map[*rtrConn]bool
-	perIP   map[string]int // clientKey -> 연결 수 (Accept 때 더하고 run 이 끝날 때 뺌)
-	total   int
-	refused int // 상한으로 거절한 연결 수 (로그는 1 분에 한 번)
+	perIP   map[string]int // 공개 쪽 clientKey -> 연결 수 (Accept 때 더하고 run 이 끝날 때 뺌)
+	per48   map[string]int // 공개 쪽 IPv6 /48 -> 연결 수
+	total   int            // 공개 쪽 연결 수
+	trusted int            // trusted 연결 수
+	refused int            // 상한으로 거절한 연결 수 (로그는 1 분에 한 번)
 	refLog  time.Time
+
+	fullAt    map[string][]time.Time // rtrSlot.fullKey -> 최근 전체 전송 시각 (rtrFullPerClient)
+	fullSweep time.Time              // fullAt 의 오래된 항목을 지운 때
 
 	// 판 올리기 (handover.go) : 연결마다 PDU 경계에서 읽기를 멈추고 (park) 기다림
 	pausing  atomic.Bool
@@ -97,7 +116,7 @@ type rtrConn struct {
 	c        net.Conn
 	remote   string
 	trans    string       // tcp / tcp-md5 / tcp-ao / tls
-	key      string       // clientKey (연결 수 셈)
+	slot     rtrSlot      // take 로 잡은 자리 (run 이 끝날 때 돌려줌)
 	lastFull time.Time    // 마지막 전체 전송 (rtrFullEvery)
 	ver      atomic.Int32 // 협상된 버전, -1 = 아직 모름
 	wmu      sync.Mutex
@@ -107,7 +126,17 @@ type rtrConn struct {
 	sentSer  atomic.Uint32
 	pending  []byte // 받았지만 아직 PDU 하나가 안 된 바이트 (판 올리기 때 새 판으로 넘김)
 	rbuf     []byte
-	resumed  bool // 판 올리기로 이어받은 연결
+	resumed  bool        // 판 올리기로 이어받은 연결
+	dead     atomic.Bool // 쓰기 실패로 닫음 (send) : run 이 바로 끝냄 (판 올리기 중에 닫힌 연결을 park 해 넘기지 않게)
+}
+
+// rtrSlot : 연결 하나가 잡은 자리 (take)
+type rtrSlot struct {
+	taken   bool   // false = 자리를 안 잡은 연결 (시험), release 안 함
+	trusted bool   // rtr.trusted 대역
+	key     string // 공개 : clientKey (IPv6 /64), trusted : ""
+	key48   string // 공개 IPv6 : /48, 그 밖 ""
+	fullKey string // 전체 전송 횟수를 세는 열쇠 (공개 = clientKey, trusted = "" = 세지 않음)
 }
 
 // errPaused : 판 올리기로 읽기를 멈춤 (readPDU)
@@ -124,6 +153,7 @@ type rtrClientInfo struct {
 	Since     time.Time `json:"since"`
 	LastQuery time.Time `json:"last_query"`
 	Serial    uint32    `json:"serial"`
+	Trusted   bool      `json:"trusted"` // rtr.trusted 대역 (11-05)
 }
 
 func (s *rtrServer) clientsInfo() []rtrClientInfo {
@@ -131,7 +161,7 @@ func (s *rtrServer) clientsInfo() []rtrClientInfo {
 	defer s.mu.Unlock()
 	var out []rtrClientInfo
 	for c := range s.active {
-		out = append(out, rtrClientInfo{c.remote, c.trans, int(c.ver.Load()), c.since, time.Unix(c.lastQ.Load(), 0), c.sentSer.Load()})
+		out = append(out, rtrClientInfo{c.remote, c.trans, int(c.ver.Load()), c.since, time.Unix(c.lastQ.Load(), 0), c.sentSer.Load(), c.slot.trusted})
 	}
 	return out
 }
@@ -148,15 +178,17 @@ func (s *rtrServer) allowed(addr net.Addr) bool {
 	return s.allowedIP(ip.Unmap())
 }
 
+// allowedIP : 허용 목록 또는 trusted 에 듦
 func (s *rtrServer) allowedIP(ip netip.Addr) bool {
 	s.cmu.RLock()
 	defer s.cmu.RUnlock()
-	for _, p := range s.Allow {
-		if p.Contains(ip) {
-			return true
-		}
-	}
-	return false
+	return prefixesContain(&s.Allow, ip) || prefixesContain(&s.Trusted, ip)
+}
+
+func (s *rtrServer) trustedIP(ip netip.Addr) bool {
+	s.cmu.RLock()
+	defer s.cmu.RUnlock()
+	return prefixesContain(&s.Trusted, ip)
 }
 
 // timers : End of Data 에 실을 refresh / retry / expire
@@ -166,12 +198,13 @@ func (s *rtrServer) timers() (uint32, uint32, uint32) {
 	return s.Refresh, s.Retry, s.Expire
 }
 
-// setLive : reload 로 허용 목록 / 타이머를 바꿈. 새 목록에 없는 주소의 연결은 끊음 (돌려주는 값 = 끊은 수)
-// 타이머는 다음 End of Data 부터 (이미 받은 라우터는 다음 Serial Query 응답 때 새 값을 받음)
-func (s *rtrServer) setLive(allow []netip.Prefix, refresh, retry, expire uint32, maxConns, maxPerIP int) int {
+// setLive : reload 로 허용 목록 / 타이머를 바꿈. 새 목록 (allow + trusted) 에 없는 주소의 연결은 끊음 (돌려주는 값 = 끊은 수)
+// 타이머는 다음 End of Data 부터 (이미 받은 라우터는 다음 Serial Query 응답 때 새 값을 받음).
+// trusted 가 바뀌어도 붙어 있는 연결의 셈 (trusted / 공개) 은 그대로, 다음 연결부터 새 목록으로 셈
+func (s *rtrServer) setLive(allow, trusted []netip.Prefix, refresh, retry, expire uint32, maxConns, maxPerIP, trustedMax int) int {
 	s.cmu.Lock()
-	s.Allow, s.Refresh, s.Retry, s.Expire = allow, refresh, retry, expire
-	s.MaxConns, s.MaxPerIP = maxConns, maxPerIP
+	s.Allow, s.Trusted, s.Refresh, s.Retry, s.Expire = allow, trusted, refresh, retry, expire
+	s.MaxConns, s.MaxPerIP, s.TrustedMax = maxConns, maxPerIP, trustedMax
 	s.cmu.Unlock()
 	s.mu.Lock()
 	var drop []*rtrConn
@@ -192,36 +225,112 @@ func (s *rtrServer) setLive(allow []netip.Prefix, refresh, retry, expire uint32,
 }
 
 // take : 연결 하나 자리를 잡음 (상한을 넘으면 false). 거절은 1 분에 한 번 로그
-func (s *rtrServer) take(key string) bool {
+//
+//	trusted : TrustedMax 만 (주소당 상한 없음)
+//	공개    : 공개 쪽 전체 MaxConns, 주소 (IPv6 /64) 마다 MaxPerIP, IPv6 /48 마다 rtrMaxPer48 (MaxPerIP 가 0 이면 /48 도 없음)
+func (s *rtrServer) take(remote string) (rtrSlot, bool) {
+	sl := rtrSlot{taken: true, key: clientKey(remote)}
+	sl.fullKey = sl.key
+	if ap, err := netip.ParseAddrPort(remote); err == nil {
+		ip := ap.Addr().Unmap()
+		if s.trustedIP(ip) {
+			sl.trusted, sl.key, sl.fullKey = true, "", ""
+		} else if ip.Is6() {
+			p, _ := ip.Prefix(48)
+			sl.key48 = p.String()
+		}
+	}
 	s.cmu.RLock()
-	maxConns, maxPerIP := s.MaxConns, s.MaxPerIP
+	maxConns, maxPerIP, trustedMax := s.MaxConns, s.MaxPerIP, s.TrustedMax
 	s.cmu.RUnlock()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.perIP == nil {
-		s.perIP = map[string]int{}
+		s.perIP, s.per48 = map[string]int{}, map[string]int{}
 	}
-	if (maxConns > 0 && s.total >= maxConns) || (maxPerIP > 0 && s.perIP[key] >= maxPerIP) {
+	var over string
+	switch {
+	case sl.trusted:
+		if trustedMax > 0 && s.trusted >= trustedMax {
+			over = fmt.Sprintf("trusted %d / %d", s.trusted, trustedMax)
+		}
+	case maxConns > 0 && s.total >= maxConns,
+		maxPerIP > 0 && s.perIP[sl.key] >= maxPerIP,
+		maxPerIP > 0 && sl.key48 != "" && s.per48[sl.key48] >= rtrMaxPer48:
+		over = fmt.Sprintf("total %d / %d, this address %d / %d", s.total, maxConns, s.perIP[sl.key], maxPerIP)
+		if sl.key48 != "" {
+			over += fmt.Sprintf(", this /48 %d / %d", s.per48[sl.key48], rtrMaxPer48)
+		}
+	}
+	if over != "" {
 		s.refused++
 		if time.Since(s.refLog) > time.Minute {
-			s.Logf("rtr %s: connection limit (total %d / %d, this address %d / %d), refused %d since last log",
-				key, s.total, maxConns, s.perIP[key], maxPerIP, s.refused)
+			s.Logf("rtr %s: connection limit (%s), refused %d since last log", remote, over, s.refused)
 			s.refLog, s.refused = time.Now(), 0
 		}
-		return false
+		return rtrSlot{}, false
+	}
+	if sl.trusted {
+		s.trusted++
+		return sl, true
 	}
 	s.total++
-	s.perIP[key]++
-	return true
+	s.perIP[sl.key]++
+	if sl.key48 != "" {
+		s.per48[sl.key48]++
+	}
+	return sl, true
 }
 
-func (s *rtrServer) release(key string) {
-	s.mu.Lock()
-	s.total--
-	if s.perIP[key]--; s.perIP[key] <= 0 {
-		delete(s.perIP, key)
+func (s *rtrServer) release(sl rtrSlot) {
+	if !sl.taken {
+		return
 	}
-	s.mu.Unlock()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if sl.trusted {
+		s.trusted--
+		return
+	}
+	s.total--
+	if s.perIP[sl.key]--; s.perIP[sl.key] <= 0 {
+		delete(s.perIP, sl.key)
+	}
+	if sl.key48 != "" {
+		if s.per48[sl.key48]--; s.per48[sl.key48] <= 0 {
+			delete(s.per48, sl.key48)
+		}
+	}
+}
+
+// allowFull : 이 주소가 지금 전체를 받아도 되나 (rtrFullEvery 안에 rtrFullPerClient 번까지). 되면 기록
+func (s *rtrServer) allowFull(key string) bool {
+	now := time.Now()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.fullAt == nil {
+		s.fullAt = map[string][]time.Time{}
+	}
+	if now.Sub(s.fullSweep) > rtrFullEvery { // 오래된 항목 지움 (1 분에 한 번)
+		for k, ts := range s.fullAt {
+			if now.Sub(ts[len(ts)-1]) >= rtrFullEvery {
+				delete(s.fullAt, k)
+			}
+		}
+		s.fullSweep = now
+	}
+	var recent []time.Time
+	for _, t := range s.fullAt[key] {
+		if now.Sub(t) < rtrFullEvery {
+			recent = append(recent, t)
+		}
+	}
+	if len(recent) >= rtrFullPerClient {
+		s.fullAt[key] = recent
+		return false
+	}
+	s.fullAt[key] = append(recent, now)
+	return true
 }
 
 // closeAll : 붙어 있는 라우터 연결을 모두 끊음 (묵은 데이터 / 종료). 끊은 수
@@ -265,8 +374,8 @@ func (s *rtrServer) serve(ln net.Listener) error {
 			c.Close()
 			continue
 		}
-		key := clientKey(c.RemoteAddr().String())
-		if !s.take(key) {
+		slot, ok := s.take(c.RemoteAddr().String())
+		if !ok {
 			c.Close()
 			continue
 		}
@@ -274,7 +383,7 @@ func (s *rtrServer) serve(ln net.Listener) error {
 			tc.SetKeepAlive(true)
 			tc.SetKeepAlivePeriod(60 * time.Second)
 		}
-		rc := &rtrConn{srv: s, c: c, remote: c.RemoteAddr().String(), key: key, trans: s.transportOf(c),
+		rc := &rtrConn{srv: s, c: c, remote: c.RemoteAddr().String(), slot: slot, trans: s.transportOf(c),
 			w: bufio.NewWriterSize(c, 64*1024), since: time.Now()}
 		rc.ver.Store(-1)
 		s.register(rc) // go 전에 : 판 올리기가 막 받은 연결도 기다려서 넘김
@@ -284,7 +393,7 @@ func (s *rtrServer) serve(ln net.Listener) error {
 				tc.SetDeadline(time.Now().Add(15 * time.Second))
 				if err := tc.Handshake(); err != nil {
 					s.Logf("rtr %s: tls handshake: %v", rc.remote, err)
-					c.Close()
+					rc.drop() // 자리 / 활성 목록 돌려줌 (11-05 검토 6 : 전에는 c.Close 만 = 자리가 샘)
 					return
 				}
 				tc.SetDeadline(time.Time{})
@@ -305,6 +414,17 @@ func (s *rtrServer) register(rc *rtrConn) {
 	s.clients.Add(1)
 }
 
+// drop : 연결을 닫고 활성 목록 / 자리 / 연결 수를 돌려줌 (register 와 짝, run 의 끝 또는 TLS 인사 실패)
+func (rc *rtrConn) drop() {
+	s := rc.srv
+	rc.c.Close()
+	s.mu.Lock()
+	delete(s.active, rc)
+	s.mu.Unlock()
+	s.release(rc.slot)
+	s.clients.Add(-1)
+}
+
 // run : 연결 하나를 끝날 때까지 (register 뒤에 부름)
 func (rc *rtrConn) run() {
 	s := rc.srv
@@ -319,14 +439,7 @@ func (rc *rtrConn) run() {
 	defer func() {
 		close(done)
 		s.St.unsubscribe(notify)
-		rc.c.Close()
-		s.mu.Lock()
-		delete(s.active, rc)
-		s.mu.Unlock()
-		if rc.key != "" { // serve 를 거친 연결만 자리를 잡았음
-			s.release(rc.key)
-		}
-		s.clients.Add(-1)
+		rc.drop()
 		if p := recover(); p != nil {
 			s.Logf("rtr %s: panic: %v", rc.remote, p)
 		}
@@ -350,6 +463,10 @@ func (rc *rtrConn) run() {
 	}()
 
 	for {
+		if rc.dead.Load() {
+			s.Logf("rtr %s: write failed, closed", rc.remote)
+			return
+		}
 		// 질의 없이 오래 붙어만 있는 연결은 끊음 (인터넷에 열 때 자리 차지 막기). 버전을 모르면 = 아직 첫 PDU 전
 		if rc.ver.Load() < 0 {
 			rc.c.SetReadDeadline(time.Now().Add(rtrFirstQuery))
@@ -401,9 +518,14 @@ func (rc *rtrConn) run() {
 				rc.sendError(errCorruptData, pdu, "bad Reset Query length")
 				return
 			}
-			// 전체는 연결마다 1 분에 한 번 : 넘으면 No Data Available (치명적이 아님, 라우터는 retry 뒤 다시) = 대역 남용 막기
+			// 전체는 연결마다 1 분에 한 번, 공개 쪽 주소마다 1 분에 rtrFullPerClient 번 : 넘으면 No Data Available
+			// (치명적이 아님, 라우터는 retry 뒤 다시) = 대역 남용 막기
 			if !rc.lastFull.IsZero() && time.Since(rc.lastFull) < rtrFullEvery {
 				rc.sendError(errNoData, pdu, "full set at most once per minute per connection")
+				continue
+			}
+			if rc.slot.fullKey != "" && !s.allowFull(rc.slot.fullKey) {
+				rc.sendError(errNoData, pdu, fmt.Sprintf("full set at most %d times per minute per client", rtrFullPerClient))
 				continue
 			}
 			rc.lastFull = time.Now()
@@ -481,6 +603,8 @@ func (rc *rtrConn) park() {
 }
 
 // pauseAll : 모든 연결에 멈추라고 함 (읽기 시간 제한을 지금으로). 새 연결은 부르는 쪽이 듣기 소켓을 닫아 막음
+// 쓰는 중인 연결은 쓰기 시간을 rtrPauseWrite 로 줄임 : 응답을 읽지 않는 연결은 쓰기가 실패해 끊기고 (run 이 끝남)
+// 판 올리기는 나머지로 진행 (11-05 검토 9). 쓰지 않는 연결의 기한은 다음 send 가 다시 정함
 func (s *rtrServer) pauseAll() {
 	s.pmu.Lock()
 	s.resumeCh = make(chan struct{})
@@ -490,6 +614,7 @@ func (s *rtrServer) pauseAll() {
 	s.mu.Lock()
 	for c := range s.active {
 		c.c.SetReadDeadline(time.Now())
+		c.c.SetWriteDeadline(time.Now().Add(rtrPauseWrite))
 	}
 	s.mu.Unlock()
 }
@@ -596,14 +721,19 @@ func (rc *rtrConn) put32(v uint32) {
 	rc.w.Write(b[:])
 }
 
-// send : fn 이 쓰는 PDU 들을 한 번에 보냄 (쓰기 시간 제한 5 분 = 큰 전체 전송 포함)
+// send : fn 이 쓰는 PDU 들을 한 번에 보냄 (쓰기 시간 제한 5 분 = 큰 전체 전송 포함, 판 올리기 중이면 rtrPauseWrite)
 func (rc *rtrConn) send(fn func()) error {
 	rc.wmu.Lock()
 	defer rc.wmu.Unlock()
-	rc.c.SetWriteDeadline(time.Now().Add(5 * time.Minute))
+	limit := 5 * time.Minute
+	if rc.srv.pausing.Load() {
+		limit = rtrPauseWrite
+	}
+	rc.c.SetWriteDeadline(time.Now().Add(limit))
 	fn()
 	err := rc.w.Flush()
 	if err != nil {
+		rc.dead.Store(true)
 		rc.c.Close()
 	}
 	return err
@@ -701,17 +831,18 @@ func (rc *rtrConn) sendFull() {
 	}
 	rc.send(func() {
 		rc.putHeader(pduCacheResp, ses, 8)
-		for v := range cur.VRPs {
+		// 정렬된 순서 (json-delta 전체와 같은 목록, 집합마다 한 번 만듦)
+		for _, v := range cur.sortedVRPs() {
 			rc.putPrefix(v, true)
 		}
 		if rc.ver.Load() >= 1 {
-			for k := range cur.Keys {
+			for _, k := range cur.sortedKeys() {
 				rc.putRouterKey(k, true)
 			}
 		}
 		if rc.ver.Load() >= 2 {
-			for c, ps := range cur.ASPAs {
-				rc.putASPA(c, ps, true)
+			for _, c := range sortedASPACustomers(cur) {
+				rc.putASPA(c, cur.ASPAs[c], true)
 			}
 		}
 		rc.putEndOfData(ses, ser)

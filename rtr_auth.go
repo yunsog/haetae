@@ -275,20 +275,22 @@ func runRTRStdio(addr string) int {
 		fmt.Fprintln(os.Stderr, "rtr-stdio:", err)
 		return 1
 	}
-	done := make(chan struct{}, 2)
+	relayStdio(c, os.Stdin, os.Stdout)
+	return 0
+}
+
+// relayStdio : in -> c, c -> out 을 옮김. 끝은 RTR 쪽 (c -> out) 이 정함 (11-04 고침)
+//   - 라우터가 보내기만 닫음 (in EOF) : RTR 쪽에도 보내기 끝 (CloseWrite) 만 알리고, 남은 응답은 끝까지 넘김
+//     (전에는 여기서 바로 닫아 해태가 보내던 응답이 잘림)
+//   - 라우터가 끊음 : sshd 가 in 을 닫음 -> 위와 같이 RTR 쪽에 알림 -> 해태가 연결을 닫음 -> 끝
+//   - 해태가 끊음 (유휴 시간 등) : c -> out 이 끝남 -> 바로 끝 (in 을 기다리지 않음)
+func relayStdio(c net.Conn, in io.Reader, out io.Writer) {
 	go func() {
-		io.Copy(c, os.Stdin)
-		// 라우터 쪽이 닫으면 RTR 쪽에도 끝을 알림
+		io.Copy(c, in)
 		if tc, ok := c.(*net.TCPConn); ok {
 			tc.CloseWrite()
 		}
-		done <- struct{}{}
 	}()
-	go func() {
-		io.Copy(os.Stdout, c)
-		done <- struct{}{}
-	}()
-	<-done
+	io.Copy(out, c)
 	c.Close()
-	return 0
 }

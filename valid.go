@@ -6,13 +6,21 @@ package main
 // 마지막으로 확인을 통과한 묶음으로 다시 검증함 (rpki-client / Routinator 와 같음). 직전 묶음도 기간이 지나면 저절로 실패.
 // manifest 번호가 직전보다 작아지면 (되돌리기) 새것을 틀린 것으로 봄 (RFC 9286 4.2.1).
 //
-// 저장 : <cache>/valid/<manifest URI 경로>.d/ 아래에 manifest 와 나열된 파일 (같은 이름), NUMBER (manifest 번호 10 진수)
+// 번호 비교는 저장본이 지금도 유효할 때만 : 저장본이 만료됐으면 번호가 작은 새것을 받음 (CA 를 다시 만들어 번호가 처음부터인 경우,
+// 전에는 저장본 만료 뒤 그 CA 가 영구히 빠짐, 11-05 검토 4).
+//
+// 저장 : <cache>/valid/<hex>/ 아래에 manifest 와 나열된 파일 (같은 이름), NUMBER (manifest 번호 10 진수)
+//   <hex> = sha256(CA 공개 키 ‖ notify ‖ manifest URI). manifest URI 만으로 정하면 아무 CA 가 남의 manifest URI 를 쓴 자식 CA 를 만들어
+//   남의 저장본 (번호) 을 덮어쓸 수 있음 (11-05 검토 3). 같은 키를 얻으려면 그 CA 의 공개 키와 받는 곳을 그대로 써야 함
+//   = 들어오는 데이터가 진짜 그 CA 것. 0.3.0 전 저장 모양 (<manifest URI 경로>.d) 은 쓰지 않고 cleanValid 가 지움
 //   파일은 받은 캐시의 hard link (내용이 바뀌면 캐시 쪽은 새 파일로 바뀌므로 저장본은 그대로). 다른 파일 시스템이면 복사
 //   manifest 가 바뀐 publication point 만 다시 씀 (평소 회차는 수백 곳)
 // 상주 모드만 씀 (validator.ValidDir). -validate (오프라인 비교) 는 끔 = rpki-client -n 과 같은 조건
 
 import (
 	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"math/big"
 	"os"
@@ -21,13 +29,15 @@ import (
 	"strings"
 )
 
-// validPPDir : manifest URI 의 저장 폴더
-func validPPDir(validDir, mftURI string) (string, error) {
-	p, err := uriPath(validDir, mftURI)
-	if err != nil {
-		return "", err
-	}
-	return p + ".d", nil
+// validPPDir : CA 하나의 저장 폴더 (공개 키 + notify + manifest URI)
+func validPPDir(validDir string, c *rpkiCert) string {
+	h := sha256.New()
+	h.Write(c.X509.RawSubjectPublicKeyInfo)
+	h.Write([]byte{0})
+	h.Write([]byte(c.Notify))
+	h.Write([]byte{0})
+	h.Write([]byte(c.Manifest))
+	return filepath.Join(validDir, hex.EncodeToString(h.Sum(nil)))
 }
 
 // validAt : 저장 폴더 안의 파일 (객체 URI 의 파일 이름만 씀)
@@ -101,23 +111,21 @@ func storeValid(dir, mftName string, pp *pubPoint) error {
 }
 
 // cleanValid : 이번 회차에 보지 않은 CA 의 저장본을 지움 (CA 가 없어짐). 모든 TA 가 끝까지 돈 회차에서만 부름
+// valid/ 바로 아래만 봄 : 본 폴더 말고는 모두 지움 (저장 도중 끊긴 .tmp / .old, 0.3.0 전 모양의 호스트 폴더 포함)
 func cleanValid(validDir string, seen map[string]bool) (removed int) {
-	filepath.WalkDir(validDir, func(p string, e os.DirEntry, err error) error {
-		if err != nil || !e.IsDir() {
-			return nil
+	ents, err := os.ReadDir(validDir)
+	if err != nil {
+		return 0
+	}
+	for _, e := range ents {
+		p := filepath.Join(validDir, e.Name())
+		if seen[p] {
+			continue
 		}
-		switch {
-		case strings.HasSuffix(p, ".d.tmp"), strings.HasSuffix(p, ".d.old"):
-			os.RemoveAll(p) // 저장 도중 끊긴 흔적
-			return filepath.SkipDir
-		case strings.HasSuffix(p, ".d"):
-			if !seen[p] {
-				os.RemoveAll(p)
-				removed++
-			}
-			return filepath.SkipDir
+		os.RemoveAll(p)
+		if !strings.HasSuffix(p, ".tmp") && !strings.HasSuffix(p, ".old") {
+			removed++
 		}
-		return nil
-	})
+	}
 	return removed
 }

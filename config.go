@@ -3,7 +3,8 @@ package main
 // config.go : 설정 파일 (기본 /etc/haetae/haetae.conf, 상주 모드만)
 //
 // 모양
-//   # 주석 (줄 어디서나 # 뒤는 무시)
+//   # 주석 (줄 어디서나 # 뒤는 무시, 따옴표 안의 # 은 글자)
+//   cert = "/etc/haetae/a#1.pem"   값을 따옴표로 감싸도 됨 (따옴표는 뗌, 11-04)
 //   [rtr]                         구역
 //   listen = :3323                키 = 값
 //   allow  = 127.0.0.1, ::1,      값이 쉼표로 끝나면 다음 줄에 이어짐 (목록을 여러 줄로)
@@ -35,6 +36,7 @@ var confKeys = map[string]string{
 
 	"fetch.interval": "interval",
 	"fetch.jobs":     "fetch-j",
+	"fetch.deadline": "fetch-deadline",
 	"fetch.rsync":    "!norsync",
 
 	"validation.workers":       "j",
@@ -45,6 +47,8 @@ var confKeys = map[string]string{
 	"rtr.stale-close":          "stale-close",
 	"rtr.max-conns":            "rtr-max-conns",
 	"rtr.max-per-ip":           "rtr-max-per-ip",
+	"rtr.trusted":              "rtr-trusted",
+	"rtr.trusted-max-conns":    "rtr-trusted-max-conns",
 
 	"rtr.listen":  "rtr",
 	"rtr.allow":   "rtr-allow",
@@ -82,9 +86,9 @@ func parseConf(r io.Reader) ([]confEntry, error) {
 	var cur *confEntry // 쉼표로 끝나 다음 줄을 기다리는 항목
 	for sc.Scan() {
 		n++
-		line := sc.Text()
-		if i := strings.IndexByte(line, '#'); i >= 0 {
-			line = line[:i]
+		line, err := stripComment(sc.Text())
+		if err != nil {
+			return nil, fmt.Errorf("%d 줄 : %v", n, err)
 		}
 		line = strings.TrimSpace(line)
 		if cur != nil { // 앞 줄이 쉼표로 끝남 -> 이어 붙임
@@ -137,9 +141,71 @@ func parseConf(r io.Reader) ([]confEntry, error) {
 		return nil, fmt.Errorf("%d 줄 : %s 의 목록이 쉼표로 끝났는데 파일이 끝남", cur.Line, cur.Key)
 	}
 	for i := range out {
-		out[i].Val = strings.Join(splitList(out[i].Val), ",") // "a, b ,c" -> "a,b,c" (목록 아닌 값은 그대로)
+		v, err := confValue(out[i].Val) // "a, b ,c" -> "a,b,c", 감싼 따옴표 뗌 (목록 아닌 값은 항목 하나)
+		if err != nil {
+			return nil, fmt.Errorf("%d 줄 : %s : %v", out[i].Line, out[i].Key, err)
+		}
+		out[i].Val = v
 	}
 	return out, nil
+}
+
+// stripComment : 따옴표 밖의 # 부터 줄 끝까지 지움 (따옴표 안의 # 은 글자, 11-04). 닫히지 않은 따옴표 = 오류
+func stripComment(line string) (string, error) {
+	in := false
+	for i := 0; i < len(line); i++ {
+		switch line[i] {
+		case '"':
+			in = !in
+		case '#':
+			if !in {
+				return line[:i], nil
+			}
+		}
+	}
+	if in {
+		return "", errors.New("따옴표가 닫히지 않음")
+	}
+	return line, nil
+}
+
+// confValue : 값을 따옴표 밖의 쉼표로 나눠 항목마다 앞뒤 공백과 감싼 따옴표를 뗀 뒤 쉼표로 다시 이음.
+// 따옴표는 항목 전체를 감쌀 때만 ("/a#b" 는 됨, ab"c 나 "a"b 는 오류 = 뜻이 모호한 값으로 시작하지 않음)
+func confValue(v string) (string, error) {
+	var items []string
+	var b strings.Builder
+	in := false
+	flush := func() error {
+		s := strings.TrimSpace(b.String())
+		b.Reset()
+		if strings.Contains(s, `"`) {
+			if len(s) < 2 || s[0] != '"' || s[len(s)-1] != '"' || strings.Contains(s[1:len(s)-1], `"`) {
+				return fmt.Errorf("따옴표는 값 전체를 감쌀 때만 : %s", s)
+			}
+			s = s[1 : len(s)-1]
+		}
+		if s != "" {
+			items = append(items, s)
+		}
+		return nil
+	}
+	for i := 0; i < len(v); i++ {
+		switch c := v[i]; {
+		case c == '"':
+			in = !in
+			b.WriteByte(c)
+		case c == ',' && !in:
+			if err := flush(); err != nil {
+				return "", err
+			}
+		default:
+			b.WriteByte(c)
+		}
+	}
+	if err := flush(); err != nil {
+		return "", err
+	}
+	return strings.Join(items, ","), nil
 }
 
 // applyConf : 항목을 옵션에 넣음. 명령줄에 준 옵션은 건너뜀. 돌려주는 것 = 로그용 "키=값" 목록

@@ -57,6 +57,7 @@ sudo useradd --system --home-dir /var/lib/haetae --shell /usr/sbin/nologin haeta
 
 # 2) Build (Go 1.26)
 cd <source directory> && go build -o haetae . && go test ./...
+#    or download a release binary instead (linux amd64 / arm64, see below)
 
 # 3) Binary / configuration / service
 sudo install -m 755 haetae /usr/local/bin/haetae
@@ -70,6 +71,11 @@ sudo systemctl enable --now haetae
 journalctl -u haetae -f                      # start-up log (chapter 9), then one "run ..." line every 10 minutes
 curl -s http://127.0.0.1:8323/status
 ```
+- Release binaries (0.3.0): each GitHub release has `haetae-<version>-linux-amd64`, `haetae-<version>-linux-arm64` and `SHA256SUMS`.
+  They are static (no libraries needed) and contain the TALs. Check with `sha256sum -c --ignore-missing SHA256SUMS`, then use the
+  file as `haetae` in step 3. `deploy/haetae.service` and `deploy/haetae.conf.example` come from the repository at the same tag.
+  The binaries are built from the tag with `CGO_ENABLED=0 go build -trimpath -ldflags='-s -w'`: the same Go version gives the same files
+- Requirements: Linux, about 8 GB of memory, and the `rsync` command for the rsync fallback (or `fetch.rsync = false`)
 - On the first start the cache is empty, so everything is fetched (about 1.5 GB, around 4 minutes). RTR is not opened during that time
 - Firewall: for RTR (3323) and any HTTP port used from outside, allow only the sources that need it (two layers together with Haetae's own allow lists)
 
@@ -83,7 +89,10 @@ curl -s http://127.0.0.1:8323/status
 | `/var/lib/haetae/out/` | Output files (section 8.3) | Haetae |
 | `/var/lib/haetae/state/` | `payload.gob` (restart state: served set + session / serial + last 200 deltas), `state.json` (session / serial, for humans), `history.jsonl` (30-day history), `lock` | Haetae |
 
-The systemd service can write only to `/var/lib/haetae` (`ProtectSystem=strict`). Its memory limit is `MemoryMax=12G`
+The systemd service can write only to `/var/lib/haetae` (`ProtectSystem=strict`). It also drops all capabilities, hides
+devices, kernel settings and other processes (`ProtectProc=invisible`), allows only IPv4 / IPv6 / Unix sockets, forbids
+writable-and-executable memory and limits system calls to `@system-service` (`systemd-analyze security haetae`: about 1.5).
+A unit file change needs `systemctl daemon-reload` and a restart (a seamless upgrade does not reload it). Its memory limit is `MemoryMax=12G`
 (actual use is about 5.3 GB; the value reported by systemd also includes page cache, which can bring it close to 8 GB).
 `Environment=GOMEMLIMIT=9GiB` sets the Go garbage collector's soft memory target: near 9 GiB the collector runs more
 often so the process stays below `MemoryMax`. It changes nothing in normal operation.
@@ -117,7 +126,7 @@ Value ranges given in parentheses are checked at start and on reload: an out-of-
 | `-c` | (empty = `/etc/haetae/haetae.conf` if it exists) | - | - | Configuration file. Daemon mode only |
 | `-cache` | daemon: `/var/lib/haetae/cache` | `paths.cache` | restart | Cache directory |
 | `-o` | daemon: `/var/lib/haetae/out` | `paths.out` | restart | Output directory |
-| `-state` | `/var/lib/haetae/state` | `paths.state` | restart | State directory (includes the lock: two instances cannot use the same directory) |
+| `-state` | `/var/lib/haetae/state` | `paths.state` | restart | State directory (includes the lock: two instances cannot use the same directory). At start-up the directory is set to 0750 and the lock file to 0600, so other accounts cannot hold the lock and block the next restart |
 | `-tal` | (empty = the 5 built-in TALs) | `paths.tal` | next cycle | TAL directory (`*.tal`). Only for emergency RIR key rollovers (section 7.6) |
 | `-slurm` | (none) | `paths.slurm` | next cycle | SLURM file (if it is broken, that cycle is not applied) |
 
@@ -127,6 +136,7 @@ Value ranges given in parentheses are checked at start and on reload: an out-of-
 |---|---|---|---|---|
 | `-interval` | `10m` | `fetch.interval` | next cycle | Cycle interval (at least `1m`) |
 | `-fetch-j` | `32` | `fetch.jobs` | next cycle | Number of repositories fetched in parallel (1 to 1024) |
+| `-fetch-deadline` | `20m` | `fetch.deadline` | next cycle | Fetch deadline per cycle: repositories not reached by then are validated from previous data (0 = none, otherwise >= 5m, section 6.1) |
 | `-norsync` | `false` | `fetch.rsync` (inverted, `true` = use rsync) | next cycle | Do not fall back to rsync when RRDP fails |
 | `-j` | number of CPUs | `validation.workers` | next cycle | Number of parallel validation workers (1 to 1024) |
 | `-drop-warn` | `0.1` | `validation.drop-warn` | next cycle | Warn when the VRP count drops by more than this fraction compared with the previous result (0 to 1) |
@@ -151,7 +161,9 @@ Value ranges given in parentheses are checked at start and on reload: an out-of-
 | `-rtr-tls-cert` / `-rtr-tls-key` | (none) | `rtr-tls.cert` / `rtr-tls.key` | next TLS connection | Server certificate / key (PEM) |
 | `-rtr-tls-ca` | (none) | `rtr-tls.ca` | next TLS connection | If set, a router certificate issued by this CA is required |
 | `-rtr-max-conns` | `256` | `rtr.max-conns` | next connection | Concurrent RTR connections (0 = no limit). Section 7.2 |
-| `-rtr-max-per-ip` | `4` | `rtr.max-per-ip` | next connection | Concurrent RTR connections per address, IPv6 counted per /64 (0 = no limit) |
+| `-rtr-max-per-ip` | `4` | `rtr.max-per-ip` | next connection | Concurrent RTR connections per address, IPv6 counted per /64 (0 = no limit). At most 16 per IPv6 /48 (fixed) |
+| `-rtr-trusted` | (none) | `rtr.trusted` | next connection | Prefixes of your own routers: always allowed, each address counted alone, only `rtr.trusted-max-conns` applies (section 7.2) |
+| `-rtr-trusted-max-conns` | `20000` | `rtr.trusted-max-conns` | next connection | Concurrent RTR connections from trusted prefixes (0 = no limit, up to 100000) |
 | `-stale-close` | `0` (off) | `rtr.stale-close` | immediate | Close RTR (listeners and sessions) when the served set was validated longer ago than this, so routers fail over to another RP (0 = off, otherwise >= `30m`). Section 6.5 |
 | `-rtr-stdio` | - | - | - | Mode (4.1) |
 
@@ -176,10 +188,11 @@ Value formats: durations = `10m`, `2h`, `90s` / lists = comma separated (`127.0.
 - Precedence: **command-line option > configuration file > default**
 - Format
   - `key = value` under a `[section]`
-  - Everything after `#` is a comment (anywhere on a line)
+  - Everything after `#` is a comment (anywhere on a line), except inside double quotes
+  - A value may be enclosed in double quotes, which are removed: `slurm = "/etc/haetae/slurm#2.json"` (0.3.0). In a list, quote each item (`allow = "127.0.0.1", ::1`)
   - Lists are comma separated. **A line ending in a comma continues on the next line** (one line is fine too)
   - An empty value (`tal =`) means "none", the same as the default
-- Errors: unknown key / the same key twice / invalid value / a trailing comma with no following value
+- Errors: unknown key / the same key twice / invalid value / a trailing comma with no following value / an unclosed quote or a quote in the middle of a value (`/etc/"a".json`)
   - at start-up -> Haetae does not start (the journal shows the line number and the reason)
   - on reload -> nothing is changed and the current values stay in effect
 
@@ -263,8 +276,19 @@ Apply the same sources in the host firewall, so access is limited in two layers.
    - Limits against hostile repositories: size / count / depth / time limits, https only for RRDP, no path escape.
      Size limits: one object file (binary) 20 MB, the same as the Routinator default (rpki-client uses 4 MB; the largest
      real object, an ARIN CA manifest, is 3.87 MB in 2026-11). rsync files and TA certificates use the same limit.
-     An RRDP file is rejected if any XML text run (e.g. one `publish` element) is longer than the base64 limit derived from it
-     (about 54 MB = twice the base64 size of 20 MB), before it is loaded into memory
+     An RRDP file is rejected if any XML token (text, comment, CDATA, ...) or the text of one `publish` element is longer than
+     the base64 limit derived from it (about 54 MB = twice the base64 size of 20 MB), before it is loaded into memory
+   - Repository addresses: notify URIs are normalised (lower-case host, no `:443`), so the same repository written differently
+     is fetched once. A notify URI with a query, fragment or user info is not used (rsync instead, warning
+     `rpkiNotify not usable, using rsync`). At most 1,000 different repositories below one TA (more: the CA is rejected)
+   - Fetch deadline `fetch.deadline` (default 20 minutes): repositories not reached by then are not fetched and are validated
+     from previous data; fetches in progress get the remaining time. They are reported as `skipped` and do not count as failures
+   - Disk: if less than 10 GB is free on the cache file system at the start of a cycle, new repositories (never fetched before)
+     are not fetched (log `WARNING low disk`)
+   - Cleanup: after a cycle in which all TAs completed, repositories in `cache/rrdp/` and `cache/rsync/` not used by any cycle
+     for 3 days are removed (log `cache: removed N repositories unused for 72h0m0s`)
+   - Publication point size: a manifest and its listed files may total 512 MB (otherwise the CA is rejected), and at most 2 GB of
+     publication points are held in memory at once (further CAs wait), so many large repositories cannot exhaust memory
    - If the saved RRDP state exists but its directory is missing (e.g. a crash during a snapshot swap), a fresh snapshot is fetched
    - A downloaded TA certificate is checked against the TAL key (self-signed CA, same key, valid signature) before it
      replaces the cached one; a wrong file from the server never removes a good cached TA
@@ -283,15 +307,20 @@ Apply the same sources in the host firewall, so access is limited in two layers.
 2. **Validate**: TAL -> TA certificate -> CA -> manifest -> CRL / ROA / ASPA / router certificate / GBR / SPL / TAK
    - Checks signatures, manifest hashes, CRLs, validity periods, and resource containment (child ⊆ parent)
    - A bad object rejects only that object; a broken manifest rejects the whole CA publication point (RFC 9286; the same strictness as rpki-client)
+   - If processing one object hits a panic (a bug in Haetae), only that object is rejected (reason `panic: ...` with the location)
+     and the next object is processed; a panic in the manifest / CRL step rejects the CA. The process keeps running
    - SKI check: if the SKI of a certificate (TA / CA / router / object EE) is not the SHA-1 hash of its public key
      (RFC 6487 section 4.8.2), only a warning is counted: `SKI is not SHA-1 of public key` in `summary.txt` /
      `last_run.counts`, with up to 5 example URIs. The certificate is not rejected (for now)
    - Manifest fallback (RFC 9286 section 6.7): every publication point that passes is stored under
-     `<cache>/valid/<manifest URI path>.d/` (the manifest, the listed files as hard links, `NUMBER`). If the freshly fetched
+     `<cache>/valid/<hex>/` (the manifest, the listed files as hard links, `NUMBER`), where `<hex>` is the SHA-256 of the CA public key,
+     its RRDP notify URI and its manifest URI (a CA that copies another CA's manifest URI gets a different copy). If the freshly fetched
      manifest / CRL / files fail, the CA is validated again from the stored copy. The copy must still be within its validity,
      so it expires by itself. Such manifests get `"fallback": true` in `objects.jsonl`, and the warning
      `manifest failed, using previous valid publication point` is counted in `summary.txt` / `last_run.counts`
-   - A manifest number lower than the stored one is treated as a failure (rollback protection, RFC 9286 section 4.2.1)
+   - A manifest number lower than the stored one is treated as a failure (rollback protection, RFC 9286 section 4.2.1),
+     unless the stored copy is no longer valid (for example expired): then the new manifest is accepted, so a CA that was
+     re-created with numbering from the start comes back (warning `manifest number went back, previous copy no longer valid: accepted`)
    - Stored copies of CAs not seen in a cycle are removed, only when all TAs completed (log `valid: removed N stale publication points`)
    - Daemon (and `-t`) mode only. `-validate` (offline comparison) does not use it, like `rpki-client -n`.
      Tested on a real snapshot with an empty repository cache: all 55,828 publication points fell back and the
@@ -320,8 +349,9 @@ The drop check compares against a previous result and does not apply to the firs
 - `payload.gob` is written atomically (temporary file, fsync, rename) after every applied cycle, so set, session, serial and deltas always belong to the same cycle
 - If the saved set is within `max-start-age` (2 hours), **RTR is opened immediately** -> routers reconnect with the same session and fetch only the changes
 - If `payload.gob` is older than that or unreadable, a new session (always different from the old one) is created and RTR is opened after the first applied cycle (routers fetch everything again)
-- Upgrade from an older version: if `payload.gob` does not exist yet, the previous files are read once
-  (`state.json` + `out/json` + `deltas.gob`). `state.json` is still written for humans; `deltas.gob` is no longer written and is removed once `payload.gob` is saved
+- Upgrade from a version before 0.2.0: since 0.3.0 the older state files (`state.json` + `out/json` + `deltas.gob`) are no longer read,
+  so `payload.gob` is missing and a new session is created (routers fetch everything once). Upgrade through 0.2.0 to keep the session.
+  `state.json` is still written for humans only
 - RTR counts as open (`rtr_open`) only when every configured RTR listener (plain, TLS) is open. A listener that fails (e.g. port in use) is retried after each applied cycle
 - During a restart the API / RTR are unavailable for about 5 seconds
 
@@ -417,7 +447,9 @@ executes the new file, so for systemd nothing happens (no restart; the watchdog 
   30 s). The first installation of a version with this feature is a normal restart
 - If the unit file changed, use `daemon-reload` and a restart instead
 
-Commands (the new binary is installed over the old one, then the running process is told to hand over):
+`tools/upgrade.sh` does all of this and waits for the result (exit code 0 = resumed, 1 = aborted; `-n` skips `go test`).
+It assumes the unit `haetae` and the binary at `/usr/local/bin/haetae`. The same by hand (the new binary is installed
+over the old one, then the running process is told to hand over):
 
 ```
 go build -o haetae . && go test ./...
@@ -445,11 +477,16 @@ Haetae follows the version sent by the router; if it is higher than 2, Haetae an
 - Reset Query -> everything / Serial Query -> only the changes (if the serial is not in the history: Cache Reset -> the router fetches everything)
 - When a new serial is created, a Serial Notify is sent to all connected routers
 - Addresses outside the allow list are closed at once, with one log line
-- Limits for an RTR port open to many clients: at most `rtr.max-conns` (256) connections and `rtr.max-per-ip` (4, IPv6 per /64)
-  per address; more are closed at once (logged at most once a minute: `rtr ...: connection limit ...`). A connection that sends
-  no PDU within 30 s, or nothing for 2 hours afterwards, is closed. A full set (Reset Query answer) is sent at most once a minute
-  per connection; a faster Reset Query gets an Error Report "No Data Available" (not fatal: the router retries after its retry
-  interval, the session stays up)
+- Limits for an RTR port open to many clients. Connections from `rtr.trusted` (your own routers) and from everyone else are counted apart:
+  - Others: at most `rtr.max-conns` (256) connections, `rtr.max-per-ip` (4, IPv6 per /64) per address and 16 per IPv6 /48
+  - Trusted: always allowed (even outside `rtr.allow`), each address counted alone (many router loopbacks in one /64 are fine),
+    only `rtr.trusted-max-conns` (20000). They still connect when the other connections fill their limit
+  - More are closed at once (logged at most once a minute: `rtr ...: connection limit ...`). A connection that sends
+    no PDU within 30 s, or nothing for 2 hours afterwards, is closed
+  - A full set (Reset Query answer) is sent at most once a minute per connection, and at most twice a minute per untrusted
+    address (so reconnecting does not get around it); a faster Reset Query gets an Error Report "No Data Available"
+    (not fatal: the router retries after its retry interval, the session stays up)
+  - During a version upgrade (6.7), a connection that does not read its answer is closed after 1 minute instead of blocking the upgrade
 - Plain TCP RTR open to the Internet cannot protect routers against on-path tampering: production routers should use TCP-AO
   or another transport security (7.4), or an allow list
 
@@ -469,8 +506,10 @@ On the router: Cisco IOS XR `show bgp rpki server summary`, FRR `show rpki cache
 | TCP-MD5 (RFC 2385) | the RTR port | `rtr.auth` key file: `<address> md5 <key>` |
 | TLS | separate (e.g. 3324) | `[rtr-tls]` listen / cert / key (/ ca) |
 | SSH | 22 (system sshd) | the sshd `rpki-rtr` subsystem runs `haetae -rtr-stdio 127.0.0.1:3323` |
+| IPsec | the RTR port | nothing in Haetae: the OS (strongSwan etc.) protects packets between the server and the router |
 
-Pick the method your routers support; methods can be combined (e.g. TCP-AO for some routers, plain TCP for others).
+All six transports of RFC 8210 section 9 can be used. Pick the method your routers support; methods can be combined
+(e.g. TCP-AO for some routers, plain TCP for others).
 
 **TCP-MD5 / TCP-AO (Linux kernel, same port as plain RTR)**
 
@@ -507,6 +546,9 @@ ca     = /etc/haetae/routers-ca.pem      # optional: require router certificates
 ```
 With `ca` set, connections without a valid router certificate are closed. The RTR allow list applies to TLS as well.
 Changing `listen` needs a restart; new `cert` / `key` / `ca` files take effect with reload, from the next TLS connection.
+- A web server certificate (e.g. Let's Encrypt) works, provided the routers trust its root CA and connect by its DNS name.
+  Renew it with a deploy hook that runs `systemctl reload haetae`; existing connections are not affected.
+- The RFC port for TLS, 324, is below 1024 and cannot be opened by the haetae account; use e.g. 3324 and set the port on the router.
 
 **SSH (system sshd)**
 
@@ -526,6 +568,14 @@ Match User rpki-rtr
 ```
 - To Haetae these connections come from 127.0.0.1 (included in the default `rtr.allow`; `rtr_clients` shows 127.0.0.1)
 - Restrict which routers may log in at the sshd level (firewall for port 22, `AllowUsers`, keys instead of passwords where the router supports it)
+- If the router closes only its sending side (EOF), `-rtr-stdio` still passes Haetae's response through to the end before it exits (0.3.0)
+
+**IPsec (operating system)**
+
+IPsec is configured in the operating system (for example strongSwan or libreswan with a pre-shared key or certificates)
+between this server and the routers. The kernel protects the packets; Haetae keeps listening on the plain RTR port and
+sees ordinary TCP connections (`transport` is `tcp`). Narrow `rtr.allow` to the IPsec peers so that nobody can reach
+the RTR port outside IPsec. The router must support IPsec for its own (control-plane) traffic.
 
 ### 7.5 Timers
 refresh / retry / expire (default 600 / 300 / 7200 seconds) are sent in the End of Data PDU of v1 / v2.
@@ -537,7 +587,12 @@ Some routers prefer their own configured values. v0 has no such fields.
 - When an RIR rolls its TA key (rare):
   - normally: update `tals/` and the table, rebuild and reinstall
   - urgently: put the new TAL files in a directory, set `paths.tal = <dir>` -> `systemctl reload` (no rebuild, from the next cycle)
-- TAK (RFC 9691) objects are parsed and shown in the object list. There is no warning yet for an announced next key
+- TAK (RFC 9691) objects are parsed and shown in the object list (current / predecessor / successor key identifiers).
+  If a TAK issued by the TA lists a **successor key** (= a key rollover is announced), Haetae warns on every cycle (0.3.0):
+  log `WARNING TA key rollover announced (TAK, update TAL): <TA>: successor SKI …, certificate <URI> (<TAK URI>)`,
+  and `TAK announces successor TA key` in summary.txt, status API counts and `/metrics haetae_warnings`.
+  When you see it, update the TAL as above (Haetae does not switch keys by itself). The warning stops once the TAK names the new key as current.
+  A TAK issued by a non-TA CA, or whose current key is not the TA key, is ignored (warning `TAK not signed by TA key (ignored)`)
 
 **TA constraints are not used.** Some RPs (rpki-client) can restrict each TA's resources with local `*.constraints` files
 derived from IANA / RIR allocation data. This is not part of any RFC, and RIR TAs normally hold all resources.
@@ -594,8 +649,8 @@ Such files must be kept in sync with allocation changes; an outdated file reject
 | Full `/json-delta` (85 MB, about 1 s CPU) | Once per `delta-full-interval` per client; otherwise 429 + `Retry-After` |
 | `/json`, `/csv` for public clients | Once per `delta-full-interval` per client and file; otherwise 429 + `Retry-After` |
 | Per-client counting | IPv4 by address, IPv6 by /64 |
-| Connections | At most 256 concurrent connections per listen address (more wait in the kernel backlog) |
-| Slow / idle clients | Request header 10 s, whole request 30 s, idle keep-alive 2 min, header size 64 KiB. No write timeout (large files over slow links) |
+| Connections | At most 256 concurrent connections per listen address (more wait in the kernel backlog). Addresses outside `http.allow`: at most 8 per client and 224 in total, extra connections are closed at once; 32 are kept for internal clients |
+| Slow / idle clients | Request header 10 s, whole request 30 s, idle keep-alive 2 min, header size 64 KiB. No overall write timeout (large files over slow links), but a response that cannot send 256 KiB within 60 s is cut |
 | `/jsonext` (470 MB, about 5 s) | Off by default (`http.jsonext`) |
 | Clients | Fetch the full set once, then only the changes by `serial`. On reset replace everything; on 429 keep what you have and retry later |
 
@@ -611,13 +666,17 @@ Use `journalctl -u haetae`. Main lines (in version 0.2.0 some messages are still
 | start | `TAL (내장): afrinic ad69cadc45c0cd41, ...` | TAL source (`내장` = built-in, or the directory) and public key hashes |
 | start | `state: session 12345 serial 245, 1030503 VRPs from <time>, deltas 200 (payload.gob saved <time>)` | Continuing; RTR opened immediately with the saved set |
 | start | `state: new session 23456 (payload.gob: too old (3h0m0s))` | New session: routers fetch everything again after the first applied cycle |
-| start | `state (legacy): session ...`, `previous VRP loaded: ...` | First start after upgrading from a version without `payload.gob` |
 | start | `http allow [...] public [...]`, `http listening ...`, `rtr listening :3323 (allow [...], tcp auth keys 0)` | Listening addresses and allow lists |
 | start | `http listen 0.0.0.0:8324: ... address already in use` | That HTTP address could not be opened (skipped; Haetae keeps running) |
 | start / cycle | `rtr listen :3323: ... (retry after next applied run)` | RTR listener (or `rtr tls listen`) could not be opened; retried after each applied cycle |
 | cycle | `valid: removed 12 stale publication points` | Stored valid copies of CAs that no longer exist were removed (6.1) |
 | cycle | `run 1m12s: vrps 1030362 vaps 3925 keys 3 +4 -1 serial 142 repos map[...] 13MB applied=true` | Cycle summary (duration, counts, added / removed, repository results, bytes fetched, applied or not) |
+| cycle | `WARNING run deadline 20m0s: 37 repositories not fetched (using previous data)` | Repositories skipped because of the fetch deadline (6.1) |
+| cycle | `WARNING low disk: 8123 MB free under /var/lib/haetae/cache (< 10240 MB), new repositories are not fetched` | Low disk space (6.1) |
+| cycle | `cache: removed 3 repositories unused for 72h0m0s` | Cleanup of unused repository directories (6.1) |
+| cycle | `slow run 10m25s: slowest repos https://.../notification.xml rrdp ok 5m0s, ...` | Cycle longer than 3 minutes: the five repositories that took longest to fetch (over 1 s only, longest first). `(none over 1s, ...)` means validation was slow |
 | cycle | `... applied=false TA failed [...], keep previous` / `WARNING VRP drop ...` | Not applied / drop warning (6.2) |
+| cycle | `WARNING TA key rollover announced (TAK, update TAL): ...` | A TA announced its next key; update the TAL (7.6) |
 | cycle | `run skipped: SLURM /etc/haetae/slurm.json: ..., keep previous (serial 401)` | Cycle skipped because of a TAL / SLURM error (6.2) |
 | RTR | `rtr 192.0.2.1:51234: connected (tcp)`, `not in allow list, closed` | Router connected / refused |
 | RTR | `rtr 192.0.2.1:51234: error report from router: code 2, PDU type 1 (v1), text "..."` | Error Report from the router (code, offending PDU, text); the connection is closed |
@@ -643,7 +702,7 @@ Use `journalctl -u haetae`. Main lines (in version 0.2.0 some messages are still
 |---|---|
 | View status | `systemctl status haetae`, `curl -s localhost:8323/status` |
 | Change configuration | Edit the configuration file, `sudo systemctl reload haetae` -> check the log. For restart-only items use `restart` |
-| Install a new version | Seamless upgrade with SIGUSR2 (6.7). Otherwise `go build -o haetae .` -> `sudo install -m 755 haetae /usr/local/bin/haetae` -> `sudo systemctl restart haetae` (about 5 s pause, routers reconnect with the same session). If `deploy/haetae.service` changed, install it too and run `systemctl daemon-reload` first (6.6) |
+| Install a new version | `tools/upgrade.sh` = seamless upgrade with SIGUSR2 (6.7). Otherwise `go build -o haetae .` -> `sudo install -m 755 haetae /usr/local/bin/haetae` -> `sudo systemctl restart haetae` (about 5 s pause, routers reconnect with the same session). If `deploy/haetae.service` changed, install it too and run `systemctl daemon-reload` first (6.6) |
 | Health check | `curl -s -o /dev/null -w '%{http_code}' localhost:8323/healthz` (200 = ok, 503 = see chapter 11) |
 | Enable RTR fail-over | `rtr.stale-close = 2h` (for example) -> reload; only if routers have another RP (6.5) |
 | Add a router | Add its address to `rtr.allow` -> reload; also allow it in the firewall (RTR port) |
@@ -689,6 +748,7 @@ Use `journalctl -u haetae`. Main lines (in version 0.2.0 some messages are still
 | `paths.slurm` | `-slurm` | | `rtr.retry` | `-rtr-retry` |
 | `fetch.interval` | `-interval` | | `rtr.expire` | `-rtr-expire` |
 | `fetch.jobs` | `-fetch-j` | | `rtr-tls.listen` | `-rtr-tls` |
+| `fetch.deadline` | `-fetch-deadline` | | | |
 | `fetch.rsync` | `-norsync` (inverted) | | `rtr-tls.cert` | `-rtr-tls-cert` |
 | `validation.workers` | `-j` | | `rtr-tls.key` | `-rtr-tls-key` |
 | `validation.drop-warn` | `-drop-warn` | | `rtr-tls.ca` | `-rtr-tls-ca` |
@@ -698,6 +758,8 @@ Use `journalctl -u haetae`. Main lines (in version 0.2.0 some messages are still
 | `rtr.stale-close` | `-stale-close` | | `http.jsonext` | `-jsonext` |
 | `rtr.max-conns` | `-rtr-max-conns` | | | |
 | `rtr.max-per-ip` | `-rtr-max-per-ip` | | | |
+| `rtr.trusted` | `-rtr-trusted` | | | |
+| `rtr.trusted-max-conns` | `-rtr-trusted-max-conns` | | | |
 | | | | `http.delta-full-interval` | `-delta-full-interval` |
 
 Options not available in the configuration file (command line only): `-c`, `-t`, `-validate`, `-parse`, `-rsc`, `-rtr-stdio`, `-P`, `-fetch`, `-fail`.
