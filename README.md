@@ -23,8 +23,8 @@ before relying on it.
   time / depth limits, back-off for dead repositories.
 - **Validation** : RFC 6487 / 3779 / 6488 / 9286 / 9582, rpki-client level
   strictness, manifest-based publication point handling with the last valid
-  copy as fallback (RFC 9286 section 6.7). TA constraints files are not used
-  (they are not part of any RFC).
+  copy as fallback (RFC 9286 section 6.7). TA constraints
+  (draft-ietf-sidrops-constraining-rpki-trust-anchors) are not implemented yet.
 - **RTR** : RFC 8210 version 1 (with version 0 negotiation and Router Key PDUs)
   and version 2 (ASPA PDUs, draft-ietf-sidrops-8210bis). Session and serial are
   kept across restarts. Transport security : TCP-MD5, TCP-AO, TLS, SSH subsystem.
@@ -40,8 +40,8 @@ before relying on it.
   RTR pauses for about 2 seconds.
 - **No dependencies** : Go standard library only.
 
-On the same repository snapshot and validation time, Haetae and rpki-client 9.0
-produce the same VRPs, ASPA and router keys.
+On the same repository snapshot and validation time, Haetae and rpki-client
+(9.0 and 9.9) produce the same VRPs, ASPAs and router keys.
 
 ## Download
 

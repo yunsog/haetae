@@ -594,10 +594,11 @@ Some routers prefer their own configured values. v0 has no such fields.
   When you see it, update the TAL as above (Haetae does not switch keys by itself). The warning stops once the TAK names the new key as current.
   A TAK issued by a non-TA CA, or whose current key is not the TA key, is ignored (warning `TAK not signed by TA key (ignored)`)
 
-**TA constraints are not used.** Some RPs (rpki-client) can restrict each TA's resources with local `*.constraints` files
-derived from IANA / RIR allocation data. This is not part of any RFC, and RIR TAs normally hold all resources.
-Such files must be kept in sync with allocation changes; an outdated file rejects legitimate ROAs and ASPAs
-(for example, a prefix newly allocated by IANA to an RIR). Haetae therefore validates by the RFCs only.
+**TA constraints are not used (for now).** rpki-client can limit the resources each TA may certify with local `*.constraints` files
+derived from IANA / RIR allocation data. The mechanism is described in draft-ietf-sidrops-constraining-rpki-trust-anchors,
+an IETF SIDROPS working group draft (not yet an RFC). The files are local configuration and must follow allocation changes:
+in 2026-10 the copy shipped in a 2024 distribution package rejected valid ROAs and ASPAs for a block allocated later,
+while the current files gave no difference. Haetae does not implement constraints yet; this will be revisited when the draft becomes an RFC.
 
 ---
 
