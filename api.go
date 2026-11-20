@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 package main
 
 // api.go : HTTP API (net/http)
@@ -45,7 +47,7 @@ func writeRepoStatusQuiet(outDir string, st []repoStatus) {
 
 func (d *daemon) apiHandler() http.Handler {
 	mux := http.NewServeMux()
-	for _, name := range []string{"json", "csv", "objects.jsonl", "rejects.txt", "repos.json"} {
+	for _, name := range []string{"json", "csv", "objects.jsonl", "rejects.txt", "repos.json", "rpki.ccr"} {
 		name := name
 		mux.HandleFunc("GET /"+name, func(w http.ResponseWriter, r *http.Request) {
 			d.serveOut(w, r, name)
@@ -78,6 +80,7 @@ var outTypes = map[string]string{
 	"objects.jsonl": "application/jsonl",
 	"rejects.txt":   "text/plain; charset=utf-8",
 	"repos.json":    "application/json",
+	"rpki.ccr":      "application/rpki-ccr",
 }
 
 // serveOut : 출력 폴더의 파일 하나 (Range / If-Modified-Since 는 ServeFile 이 처리)

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 package main
 
 // gbr.go : Ghostbusters Record (RFC 6493)

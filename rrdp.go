@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 package main
 
 // rrdp.go : RRDP 수집 (RFC 8182)
@@ -67,7 +69,12 @@ type rrdpState struct {
 	ETag         string    `json:"etag,omitempty"`
 	LastModified string    `json:"last_modified,omitempty"`
 	NotifyAt     time.Time `json:"notify_at,omitzero"`
+	// RFC 9697 : 다 맞춘 notification 의 delta serial -> 해시 (최근 maxKeptDeltaHashes 개). 같은 session 에서 바뀌면 snapshot
+	Deltas map[uint64]string `json:"deltas,omitempty"`
 }
+
+// maxKeptDeltaHashes : RFC 9697 비교에 기억하는 delta 해시 수 (rpki-client 9.9 MAX_RRDP_DELTAS 와 같음)
+const maxKeptDeltaHashes = 300
 
 // rrdpFullEvery : 304 를 믿는 최대 시간. 이보다 오래 통째로 받지 않았으면 조건 없이 받음 (서버가 304 를 잘못 줘도 1 시간 안에 바로잡힘)
 const rrdpFullEvery = time.Hour
@@ -121,7 +128,9 @@ func loadRRDPState(p string) (*rrdpState, error) {
 func saveRRDPState(p string, s *rrdpState) error {
 	b, _ := json.MarshalIndent(s, "", " ")
 	tmp := p + ".tmp"
-	if err := os.WriteFile(tmp, b, 0644); err != nil {
+	// 상태 파일만 fsync (B4). 객체 파일은 하지 않음 (snapshot 하나 수십만 개,
+	// 정전으로 깨지면 manifest 해시에서 걸려 직전 정상 저장본 = storeValid 를 씀)
+	if err := writeFileSync(tmp, b, 0644); err != nil {
 		return err
 	}
 	return os.Rename(tmp, p)
@@ -314,7 +323,15 @@ func (f *fetcher) syncRRDP(ctx context.Context, notify string) (string, rrdpResu
 	// 다 맞추면 (none / delta / snapshot 성공) 이 notification 의 ETag / Last-Modified 를 적음
 	done := func(s *rrdpState) *rrdpState {
 		s.ETag, s.LastModified, s.NotifyAt = hdr.Get("ETag"), hdr.Get("Last-Modified"), time.Now()
+		s.Deltas = deltaHashes(n, serial)
 		return s
+	}
+	if st != nil && st.Session == n.Session {
+		// RFC 9697 : 전에 본 serial 의 delta 가 바뀜 = 서버 쪽 session 어긋남 -> 경고 + snapshot
+		if ds, bad := deltaMutated(st.Deltas, n); bad {
+			f.logf("WARNING rrdp %s: delta %d hash changed in session %s (RFC 9697 desync), taking snapshot", notify, ds, n.Session)
+			st = nil
+		}
 	}
 	if st != nil && st.Session == n.Session {
 		if st.Serial == serial {
@@ -355,6 +372,34 @@ func (f *fetcher) syncRRDP(ctx context.Context, notify string) (string, rrdpResu
 	}
 	res.Action, res.Files = "snapshot", files
 	return dir, res, saveRRDPState(statePath, done(&rrdpState{Notify: notify, Session: n.Session, Serial: serial, LastSuccess: time.Now()}))
+}
+
+// deltaHashes : notification 의 delta 중 serial 이하 최근 maxKeptDeltaHashes 개의 해시 (RFC 9697 비교용)
+func deltaHashes(n *rrdpNotification, serial uint64) map[uint64]string {
+	m := map[uint64]string{}
+	for _, d := range n.Deltas {
+		s, err := strconv.ParseUint(d.Serial, 10, 64)
+		if err != nil || s > serial || serial-s >= maxKeptDeltaHashes {
+			continue
+		}
+		m[s] = strings.ToLower(d.Hash)
+	}
+	return m
+}
+
+// deltaMutated : 지난번에 기억한 serial 의 delta 해시가 새 notification 에서 다르면 그 serial 과 true
+// (지난번에 없던 serial, 목록에서 빠진 serial 은 보지 않음 = RFC 9697 3 장)
+func deltaMutated(old map[uint64]string, n *rrdpNotification) (uint64, bool) {
+	for _, d := range n.Deltas {
+		s, err := strconv.ParseUint(d.Serial, 10, 64)
+		if err != nil {
+			continue
+		}
+		if h, ok := old[s]; ok && !strings.EqualFold(h, d.Hash) {
+			return s, true
+		}
+	}
+	return 0, false
 }
 
 // applyDeltas : st.Serial+1 .. 최신 delta 를 차례로 적용 (중간이 빠졌으면 오류 -> snapshot)

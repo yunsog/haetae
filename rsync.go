@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 package main
 
 // rsync.go : 외부 rsync 명령으로 수집 (RRDP 가 없거나 오래 실패한 저장소)

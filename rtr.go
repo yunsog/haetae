@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 package main
 
 // rtr.go : RTR 서버 (RFC 8210 v1, RFC 6810 v0, draft-ietf-sidrops-8210bis v2 = ASPA)
@@ -100,6 +102,9 @@ type rtrServer struct {
 	refused int            // 상한으로 거절한 연결 수 (로그는 1 분에 한 번)
 	refLog  time.Time
 
+	// /metrics 누적 (0.4.0) : 프로세스 시작부터 (판 올리기 / 재시작이면 0 부터, Prometheus counter 는 괜찮음)
+	nReset, nSerial, nRefused atomic.Uint64
+
 	fullAt    map[string][]time.Time // rtrSlot.fullKey -> 최근 전체 전송 시각 (rtrFullPerClient)
 	fullSweep time.Time              // fullAt 의 오래된 항목을 지운 때
 
@@ -127,6 +132,7 @@ type rtrConn struct {
 	pending  []byte // 받았지만 아직 PDU 하나가 안 된 바이트 (판 올리기 때 새 판으로 넘김)
 	rbuf     []byte
 	resumed  bool        // 판 올리기로 이어받은 연결
+	proxyOK  bool        // 첫머리의 PROXY 한 줄을 받아들임 (loopback 평문 = -rtr-stdio, SSH 라우터의 실제 주소, B8)
 	dead     atomic.Bool // 쓰기 실패로 닫음 (send) : run 이 바로 끝냄 (판 올리기 중에 닫힌 연결을 park 해 넘기지 않게)
 }
 
@@ -264,6 +270,7 @@ func (s *rtrServer) take(remote string) (rtrSlot, bool) {
 	}
 	if over != "" {
 		s.refused++
+		s.nRefused.Add(1)
 		if time.Since(s.refLog) > time.Minute {
 			s.Logf("rtr %s: connection limit (%s), refused %d since last log", remote, over, s.refused)
 			s.refLog, s.refused = time.Now(), 0
@@ -374,17 +381,24 @@ func (s *rtrServer) serve(ln net.Listener) error {
 			c.Close()
 			continue
 		}
-		slot, ok := s.take(c.RemoteAddr().String())
-		if !ok {
-			c.Close()
-			continue
+		remote, trans := c.RemoteAddr().String(), s.transportOf(c)
+		// loopback 평문 (-rtr-stdio = SSH 라우터) 은 첫 바이트를 본 뒤 자리를 잡음 (takeProxy) :
+		// 여기서 127.0.0.1 로 잡으면 SSH 라우터가 모두 한 주소로 세여 주소당 상한에 걸림 (B8)
+		var slot rtrSlot
+		proxy := proxyAllowed(remote, trans)
+		if !proxy {
+			var ok bool
+			if slot, ok = s.take(remote); !ok {
+				c.Close()
+				continue
+			}
 		}
 		if tc, ok := c.(*net.TCPConn); ok {
 			tc.SetKeepAlive(true)
 			tc.SetKeepAlivePeriod(60 * time.Second)
 		}
-		rc := &rtrConn{srv: s, c: c, remote: c.RemoteAddr().String(), slot: slot, trans: s.transportOf(c),
-			w: bufio.NewWriterSize(c, 64*1024), since: time.Now()}
+		rc := &rtrConn{srv: s, c: c, remote: remote, slot: slot, trans: trans,
+			w: bufio.NewWriterSize(c, 64*1024), since: time.Now(), proxyOK: proxy}
 		rc.ver.Store(-1)
 		s.register(rc) // go 전에 : 판 올리기가 막 받은 연결도 기다려서 넘김
 		go func() {
@@ -497,6 +511,12 @@ func (rc *rtrConn) run() {
 		ver, typ := int(hdr[0]), hdr[1]
 		ln := uint32(len(pdu))
 
+		// 라우터의 Error Report 에는 어떤 경우에도 Error Report 로 답하지 않음 (8210bis-29 5.8) -> 버전 확인보다 먼저
+		if typ == pduErrorReport {
+			s.Logf("rtr %s: error report from router: code %d%s", rc.remote, binary.BigEndian.Uint16(hdr[2:]), errorReportDetail(body))
+			return
+		}
+
 		// 버전 정하기 / 확인
 		if rc.ver.Load() < 0 {
 			if ver > rtrMaxVersion {
@@ -514,6 +534,7 @@ func (rc *rtrConn) run() {
 
 		switch typ {
 		case pduResetQuery:
+			s.nReset.Add(1)
 			if ln != 8 {
 				rc.sendError(errCorruptData, pdu, "bad Reset Query length")
 				return
@@ -531,6 +552,7 @@ func (rc *rtrConn) run() {
 			rc.lastFull = time.Now()
 			rc.sendFull()
 		case pduSerialQuery:
+			s.nSerial.Add(1)
 			if ln != 12 {
 				rc.sendError(errCorruptData, pdu, "bad Serial Query length")
 				return
@@ -538,14 +560,30 @@ func (rc *rtrConn) run() {
 			ses := binary.BigEndian.Uint16(hdr[2:])
 			ser := binary.BigEndian.Uint32(body)
 			rc.sendSince(ses, ser)
-		case pduErrorReport:
-			s.Logf("rtr %s: error report from router: code %d%s", rc.remote, binary.BigEndian.Uint16(hdr[2:]), errorReportDetail(body))
-			return
 		default:
-			rc.sendError(errUnsupportedPDU, pdu, "unsupported PDU type")
+			// 이 판에 있는 PDU 인데 라우터가 보낼 것이 아니면 Invalid Request (8210bis-29 8.5), 모르는 종류면 Unsupported PDU
+			if knownPDU(typ, int(rc.ver.Load())) {
+				rc.sendError(errInvalidRequest, pdu, "PDU type not sent by routers")
+			} else {
+				rc.sendError(errUnsupportedPDU, pdu, "unsupported PDU type")
+			}
 			return
 		}
 	}
+}
+
+// knownPDU : 그 RTR 판에 정의된 PDU 종류인지 (v0 = 0~4, 6~8, 10, v1 = + Router Key 9, v2 = + ASPA 11)
+func knownPDU(typ byte, ver int) bool {
+	switch typ {
+	case pduSerialNotify, pduSerialQuery, pduResetQuery, pduCacheResp, pduIPv4Prefix, pduIPv6Prefix,
+		pduEndOfData, pduCacheReset, pduErrorReport:
+		return true
+	case pduRouterKey:
+		return ver >= 1
+	case pduASPA:
+		return ver >= 2
+	}
+	return false
 }
 
 // readPDU : PDU 하나 (머리 + 본문). 판 올리기로 멈추면 errPaused, 읽다 만 바이트는 rc.pending 에 남음
@@ -555,7 +593,14 @@ func (rc *rtrConn) readPDU() ([]byte, error) {
 		rc.rbuf = make([]byte, 4096)
 	}
 	for {
-		if len(rc.pending) >= 8 {
+		ready := true // false = PROXY 한 줄이 아직 덜 옴 -> 더 읽음
+		if rc.proxyOK && len(rc.pending) > 0 {
+			var err error
+			if ready, err = rc.takeProxy(); err != nil {
+				return nil, err
+			}
+		}
+		if ready && len(rc.pending) >= 8 {
 			ln := binary.BigEndian.Uint32(rc.pending[4:8])
 			if ln < 8 || ln > rtrMaxPDUFromRoute {
 				return rc.pending[:8], errBadLength

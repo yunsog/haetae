@@ -1,5 +1,101 @@
 # Changes
 
+## 0.4.0 (2026-11-20)
+
+### License
+
+- License changed from ISC to Apache-2.0 (`LICENSE`, new `NOTICE`); 0.3.0 and
+  earlier remain ISC.
+
+### Fixes
+
+- CRL Number (RFC 9829): a CRL whose CRL Number extension is critical,
+  negative or larger than 2^159-1 is rejected.
+- Manifest numbers (RFC 9981, RFC 9286 section 4.2.1): a manifest whose
+  thisUpdate is earlier than that of the stored valid copy is treated like a
+  lower manifest number (the stored copy is used). A changed manifest filename
+  starts the number over and is reported as the warning `manifest filename
+  changed, manifest number reset (RFC 9981)`. A manifest whose EE signedObject
+  differs from its location now fails (the stored copy is used); before it was
+  only a warning. The warning `manifest number went back, ...` is now
+  `manifest went back, ...`.
+- TA certificate tiebreaking (RFC 10097, November 2026): a downloaded TA
+  certificate replaces the cached one only if it is currently valid and not
+  older (later notBefore wins; on equal notBefore the shorter validity wins).
+  Before, any downloaded certificate with the TAL key replaced the cache, so
+  a replayed older TA certificate was accepted and an expired one rejected the
+  whole TA until the next fetch.
+- When several ASPAs exist for one customer AS, AS0 is no longer kept next to
+  other providers in the merged provider list (draft-ietf-sidrops-aspa-profile
+  section 5.2). Before, such a list was sent over RTR v2, where
+  draft-ietf-sidrops-8210bis-29 has routers reject it with Error Code 9.
+  Routinator 0.16 does the same; **rpki-client 9.9 keeps AS0** in the merged
+  list. For such a customer AS (in 2026-11 only AS59182, an ASPA `[0]` from a
+  sub-CA and `[9885, 55824]` from its parent) Haetae and Routinator give
+  `[9885, 55824]` where rpki-client gives `[0, 9885, 55824]`, in `json`, RTR
+  and the CCR ASPA state. VRPs and the other CCR states are unaffected.
+  rpki-client changed its merge in the OpenBSD source on 2026-11-16
+  (aspa.c 1.58), so its next release should give the same result.
+- Checked against the latest drafts:
+  - draft-ietf-sidrops-8210bis-29 (RTR v2): an ASPA that appeared and
+    disappeared between a router's serial and now is no longer sent as a
+    withdrawal (the router never had it; strict routers answer Error 6);
+    PDU types a router must not send get Error 3 (Invalid Request) instead
+    of 5; an Error Report from a router is never answered, even with a wrong
+    version; RTR over TLS requires TLS 1.3 (RFC 9852 in BCP 195).
+  - draft-ietf-sidrops-aspa-profile-31: ASPAs with customer AS 0, with AS0
+    next to other providers, or whose EE certificate does not hold exactly
+    one `id` equal to the customer AS are rejected; if the merged providers
+    of one customer AS exceed 10,000, all ASPAs of that customer are dropped
+    (a warning names it) instead of a partial list.
+  - draft-ietf-sidrops-rpki-prefixlist-05: SPLs with asID 0 are rejected.
+  - draft-ietf-sidrops-aspa-slurm-04: SLURM ASPA entries now use
+    `slurmVersion` 2 with `customerAsn` / `providerAsns`, both `aspaFilters`
+    and `aspaAssertions` present, providers ascending and unique. **Files
+    using the old keys (`customer_asid` / `provider_set` in version 1) are
+    rejected.**
+  None of these changed the result on a 2026-10 repository snapshot.
+- Signed objects must carry the CMS signing-time attribute and must not carry
+  binary-signing-time (RFC 9589); both were accepted before. rpki-client 9.9
+  applies the same rule. No object in a 2026-10 repository snapshot was affected.
+- RRDP session desynchronisation is detected (RFC 9697): the delta hashes of
+  the last applied notification file (the latest 300) are kept with the RRDP
+  state, and if a previously seen serial shows a different hash in the same
+  session, Haetae logs a warning and fetches the snapshot.
+
+### New
+
+- Optional TA constraints (draft-ietf-sidrops-constraining-rpki-trust-anchors-02):
+  `paths.constraints` / `-constraints` names a directory of
+  `<TAL name>.constraints` files in the format OpenBSD ships; off by default.
+  The resources listed in the EE certificates of ROAs, ASPAs and SPLs and in
+  BGPsec router certificates must not overlap a `deny` entry and must lie
+  within the `allow` entries. On a repository snapshot the result matches
+  rpki-client 9.9 (VRPs, ASPAs and the 61 rejected objects).
+- Optional CCR output (draft-ietf-sidrops-rpki-ccr-11), off by default:
+  `[ccr] mode = latest` writes `rpki.ccr` in the output directory on every
+  applied run, served as `/rpki.ccr` (internal access only), with the state
+  hashes `ccr_*_hash` in the `json` metadata under the same names as
+  rpki-client; `daily`, `hourly` and `cycle` also keep gzip archives for
+  `ccr.keep` (default 168h). On a repository snapshot the file is byte for byte identical to
+  rpki-client 9.9's.
+
+### Documentation
+
+- Build from source with `CGO_ENABLED=0` (static, as the release binaries;
+  also in `tools/upgrade.sh`). A dynamically linked build uses libc, and on
+  Ubuntu needrestart restarts the service after every libc update, which
+  drops the RTR sessions.
+
+- Corrected comparisons with rpki-client (thanks to issue #1). The speed slide
+  compared Haetae with rpki-client 9.0 from the Ubuntu 24.04 package, an old
+  release that validates on a single thread. Re-measured against rpki-client
+  9.9 with `-p`, the two are on par, so the slide no longer compares timings
+  with other RPs and shows Haetae's own operating figures instead. The TA constraints text now cites
+  draft-ietf-sidrops-constraining-rpki-trust-anchors (an IETF SIDROPS working
+  group draft) and attributes the rejected objects to an outdated constraints
+  file from a 2024 package, not to the mechanism.
+
 ## 0.3.0 (2026-11-11)
 
 Fixes from a second full code review (resource limits against hostile

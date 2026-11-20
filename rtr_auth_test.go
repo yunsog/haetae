@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 package main
 
 // rtr_auth_test.go : TCP-MD5 / TCP-AO 키를 넣은 듣기 소켓에 같은 키 / 다른 키 / 키 없이 붙어 봄, TLS RTR
@@ -254,7 +256,7 @@ func TestRTRTLSHandshakeRelease(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	srv := &rtrServer{St: &store{Session: 1}, Allow: []netip.Prefix{netip.MustParsePrefix("127.0.0.0/8")}, Logf: t.Logf, MaxPerIP: 1}
+	srv := &rtrServer{St: &store{Session: 1}, Allow: []netip.Prefix{netip.MustParsePrefix("127.0.0.0/8")}, Logf: testLogf(t), MaxPerIP: 1}
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)

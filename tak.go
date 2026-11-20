@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 package main
 
 // tak.go : Trust Anchor Key (RFC 9691)

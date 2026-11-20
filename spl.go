@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 package main
 
 // spl.go : Signed Prefix List (draft-ietf-sidrops-rpki-prefixlist, rpki-client 9 지원)
@@ -53,6 +55,9 @@ func parseSPL(der []byte) (*rpkiSPL, error) {
 	asn, err := derUint(f[0], 0xffffffff)
 	if err != nil {
 		return nil, fmt.Errorf("SPL asID: %w", err)
+	}
+	if asn == 0 {
+		return nil, fmt.Errorf("SPL asID 0") // asID INTEGER (1..4294967295), rpki-prefixlist-05 3 장
 	}
 	s.ASN = uint32(asn)
 	if !ee.ASs.Present || ee.ASs.Inherit || !asCovered(ee.ASs.Ranges, asRange{s.ASN, s.ASN}) {

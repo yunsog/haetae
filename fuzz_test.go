@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 package main
 
 // fuzz_test.go : 파서 fuzz 시험 (입력 = 인터넷의 믿을 수 없는 저장소). 객체 하나가 무엇이든 panic / 무한 루프 없이 오류로 끝나야 함

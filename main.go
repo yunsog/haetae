@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 package main
 
 // main.go : 옵션과 모드
@@ -30,7 +32,7 @@ import (
 
 // version : 해태 판 (상태 API, RRDP User-Agent, /metrics build_info, 공개 저장소 태그 v<판>). 판을 올릴 때 여기 한 곳만 고침.
 // 공개 (태그) 사이에는 다음 판 + "-dev" (11-02 사용자 : 0.2.0 공개 뒤 0.3.0-dev). 태그 때 -dev 를 뗌
-const version = "0.3.0"
+const version = "0.4.0"
 
 // 상주 모드 폴더 기본값 (10-31, 운영 = 전용 계정 haetae). 개발 때는 -cache data/cache -o data/out -state data/state 처럼 직접 줌.
 // -validate 는 기본값을 쓰지 않음 (-cache / -o 필수) : 시험 검증이 운영 캐시를 건드리지 않게
@@ -43,6 +45,8 @@ const (
 // options : 명령줄 옵션 (설정 파일 config.go 도 같은 이름으로 채움)
 type options struct {
 	parse, rscFile, failOut, cacheDir, talDir, outDir                                  *string
+	constraints, ccrMode, ccrDir                                                       *string
+	ccrKeep                                                                            *time.Duration
 	workers, fetchJobs, rtrMaxConns, rtrMaxPerIP, rtrTrustedMax                        *int
 	validate, fetch, noRsync, once                                                     *bool
 	evalTime                                                                           *int64
@@ -79,6 +83,10 @@ func defineFlags(f *flag.FlagSet) *options {
 	o.once = f.Bool("t", false, "상주 모드를 한 회차만 (시험)")
 	o.stateDir = f.String("state", defState, "상태 폴더 (잠금, session / serial, delta, 이력)")
 	o.slurmPath = f.String("slurm", "", "SLURM 파일 (RFC 8416)")
+	o.constraints = f.String("constraints", "", "TA constraints 폴더 (<TAL 이름>.constraints, draft-ietf-sidrops-constraining-rpki-trust-anchors). 빈 값 = 끔")
+	o.ccrMode = f.String("ccr", "off", "CCR 출력 rpki.ccr (draft-ietf-sidrops-rpki-ccr) : off | latest (최근 1 개) | daily | hourly | cycle (보관). -validate 는 off 아니면 rpki.ccr 하나")
+	o.ccrKeep = f.Duration("ccr-keep", 7*24*time.Hour, "CCR 보관 기간 (daily / hourly / cycle, 0 = 지우지 않음)")
+	o.ccrDir = f.String("ccr-dir", "", "CCR 보관 폴더. 빈 값 = <출력 폴더>/ccr")
 	o.interval = f.Duration("interval", 10*time.Minute, "수집 + 검증 주기")
 	o.rtrAddr = f.String("rtr", ":3323", "RTR 주소 (빈 값 = 안 엶)")
 	o.rtrAllow = f.String("rtr-allow", "127.0.0.1,::1", "RTR 허용 주소 / 대역 (쉼표)")
@@ -134,7 +142,7 @@ func main() {
 	case *o.rscFile != "":
 		os.Exit(runRSC(*o.rscFile, flag.Args(), *o.cacheDir, *o.talDir, *o.evalTime, *o.workers))
 	case *o.validate:
-		os.Exit(runValidate(*o.cacheDir, *o.talDir, *o.outDir, *o.evalTime, *o.workers, *o.fetch, *o.fetchJobs, *o.noRsync))
+		os.Exit(runValidate(*o.cacheDir, *o.talDir, *o.constraints, *o.ccrMode, *o.outDir, *o.evalTime, *o.workers, *o.fetch, *o.fetchJobs, *o.noRsync))
 	default:
 		// 상주 : 설정 파일 (있으면) -> 명령줄에 없는 옵션만 채움
 		path, applied, err := loadConfig(*o.config, flag.CommandLine)
@@ -182,11 +190,14 @@ func buildDaemonConfig(o *options) (daemonConfig, error) {
 	if *o.rtrTrustedMax < 0 || *o.rtrTrustedMax > 100000 {
 		return daemonConfig{}, fmt.Errorf("rtr-trusted-max-conns %d (0~100000)", *o.rtrTrustedMax)
 	}
+	if !validCCRMode(*o.ccrMode) || *o.ccrKeep < 0 {
+		return daemonConfig{}, fmt.Errorf("ccr %q / ccr-keep %s : off | latest | daily | hourly | cycle, 보관 기간 0 이상", *o.ccrMode, *o.ccrKeep)
+	}
 	if *o.staleWarn < 0 || *o.staleClose < 0 || (*o.staleClose > 0 && *o.staleClose < 30*time.Minute) {
 		return daemonConfig{}, fmt.Errorf("stale-warn %s / stale-close %s : 0 이상, stale-close 는 0 (끔) 또는 30m 이상", *o.staleWarn, *o.staleClose)
 	}
 	return daemonConfig{
-		CacheDir: *o.cacheDir, TALDir: *o.talDir, OutDir: *o.outDir, StateDir: *o.stateDir, SLURM: *o.slurmPath,
+		CacheDir: *o.cacheDir, TALDir: *o.talDir, Constraints: *o.constraints, OutDir: *o.outDir, StateDir: *o.stateDir, SLURM: *o.slurmPath,
 		Interval: *o.interval, Workers: *o.workers, FetchJobs: *o.fetchJobs, NoRsync: *o.noRsync, FetchDeadline: *o.fetchDeadline,
 		RTRAddr: *o.rtrAddr, RTRAllow: splitList(*o.rtrAllow), RTRTrusted: splitList(*o.rtrTrusted), RTRAuth: *o.rtrAuth,
 		RTRRefresh: uint32(*o.rtrRefresh), RTRRetry: uint32(*o.rtrRetry), RTRExpire: uint32(*o.rtrExpire),
@@ -194,6 +205,7 @@ func buildDaemonConfig(o *options) (daemonConfig, error) {
 		RTRTLSAddr: *o.rtrTLS, RTRTLSCert: *o.rtrTLSCert, RTRTLSKey: *o.rtrTLSKey, RTRTLSCA: *o.rtrTLSCA,
 		HTTPAddr: *o.httpAddr, HTTPAllow: splitList(*o.httpAllow), HTTPPublic: splitList(*o.httpPublic), JSONExt: *o.jsonExt, DeltaFullInterval: *o.deltaFull,
 		MaxStartAge: *o.maxStartAge, DropWarn: *o.dropWarn, HoldOnDrop: *o.holdDrop, StaleWarn: *o.staleWarn, StaleClose: *o.staleClose,
+		CCRMode: *o.ccrMode, CCRKeep: *o.ccrKeep, CCRDir: *o.ccrDir,
 	}, nil
 }
 
@@ -253,7 +265,7 @@ func checkRTRTimers(refresh, retry, expire uint) error {
 }
 
 // runValidate : 2 단계 오프라인 검증
-func runValidate(cacheDir, talDir, outDir string, evalTime int64, workers int, fetch bool, fetchJobs int, noRsync bool) int {
+func runValidate(cacheDir, talDir, consDir, ccrMode, outDir string, evalTime int64, workers int, fetch bool, fetchJobs int, noRsync bool) int {
 	if cacheDir == "" || outDir == "" {
 		fmt.Fprintln(os.Stderr, "-validate 에는 -cache 와 -o 가 필요")
 		return 2
@@ -271,7 +283,19 @@ func runValidate(cacheDir, talDir, outDir string, evalTime int64, workers int, f
 	}
 	fmt.Fprintf(os.Stderr, "TAL (%s): %s\n", source, talSummary(tals))
 
+	if !validCCRMode(ccrMode) {
+		fmt.Fprintf(os.Stderr, "-ccr %q : off | latest | daily | hourly | cycle\n", ccrMode)
+		return 1
+	}
 	v := newValidator(cacheDir, now, workers)
+	v.CCR = ccrMode != "off"
+	if err := v.useConstraints(consDir, tals); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		return 1
+	}
+	if consDir != "" {
+		fmt.Fprintf(os.Stderr, "constraints (%s): %s\n", consDir, constraintsSummary(v.Constraints))
+	}
 	if fetch {
 		f, err := newFetcher(cacheDir, fetchJobs)
 		if err != nil {

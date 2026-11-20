@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 package main
 
 // view.go : 조회 API 용 검증 결과 (회차마다 새로 만들고, 만든 뒤에는 바꾸지 않음)

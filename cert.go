@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 package main
 
 // cert.go : X.509 인증서 RPKI 프로파일 (RFC 6487)

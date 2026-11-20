@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 package main
 
 // ops_test.go : 묵은 데이터 (경고 / RTR 닫기), /healthz, watchdog 판단, sd_notify, 저장소 재시도 간격 (backoff, Retry-After)
@@ -56,7 +58,7 @@ func TestStaleCloseRTR(t *testing.T) {
 	d := testDaemon(t)
 	d.cfg.RTRAddr = "127.0.0.1:0"
 	d.cfg.StaleWarn, d.cfg.StaleClose = time.Hour, 90*time.Minute
-	d.rtr = &rtrServer{St: d.st, Logf: t.Logf}
+	d.rtr = &rtrServer{St: d.st, Logf: testLogf(t)}
 	d.openRTR()
 	if !d.rtrOpen {
 		t.Fatal("not open")

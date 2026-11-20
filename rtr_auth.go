@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 package main
 
 // rtr_auth.go : RTR 전송 보안 (결정 C2, RFC 8210 7 절 / RFC 6810 7 절)
@@ -19,9 +21,11 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -251,7 +255,7 @@ func rtrTLSConfig(certFile, keyFile, caFile string) (*tls.Config, error) {
 	if err != nil {
 		return nil, err
 	}
-	cfg := &tls.Config{Certificates: []tls.Certificate{cert}, MinVersion: tls.VersionTLS12}
+	cfg := &tls.Config{Certificates: []tls.Certificate{cert}, MinVersion: tls.VersionTLS13} // RFC 9852 (8210bis-29 9 장의 BCP 195)
 	if caFile != "" {
 		pem, err := os.ReadFile(caFile)
 		if err != nil {
@@ -268,15 +272,122 @@ func rtrTLSConfig(certFile, keyFile, caFile string) (*tls.Config, error) {
 
 // ---- SSH (sshd subsystem 에서 실행) ----
 
-// runRTRStdio : 표준 입출력 <-> RTR 포트. sshd 가 라우터 하나마다 실행
+// runRTRStdio : 표준 입출력 <-> RTR 포트. sshd 가 라우터 하나마다 실행.
+// 해태에게는 모든 SSH 라우터가 127.0.0.1 로 보이므로, 첫머리에 라우터의 실제 주소를 PROXY 한 줄로 알림 (B8)
 func runRTRStdio(addr string) int {
 	c, err := net.DialTimeout("tcp", addr, 10*time.Second)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "rtr-stdio:", err)
 		return 1
 	}
+	if line := proxyLine(os.Getenv("SSH_CONNECTION")); line != "" {
+		if _, err := io.WriteString(c, line); err != nil {
+			fmt.Fprintln(os.Stderr, "rtr-stdio:", err)
+			return 1
+		}
+	}
 	relayStdio(c, os.Stdin, os.Stdout)
 	return 0
+}
+
+// ---- PROXY protocol v1 한 줄 (HAProxy 문서 "proxy-protocol.txt" 2.1, 텍스트 판) ----
+//
+//	"PROXY TCP4 <라우터 IP> <서버 IP> <라우터 포트> <서버 포트>\r\n" (IPv6 는 TCP6), 최대 107 바이트
+//
+// -rtr-stdio 가 보내고, 해태는 loopback 평문 연결의 첫머리일 때만 받음 (proxyAllowed).
+// 인터넷에서 온 연결이 보내면 지금처럼 잘못된 PDU (길이 틀림) 로 끊김 = 주소를 속일 수 없음.
+// 같은 서버의 다른 계정은 속일 수 있음 (해태를 돌리는 서버에 아무나 로그인하지 않는다는 전제)
+
+const proxyMaxLine = 107
+
+// proxyLine : sshd 의 SSH_CONNECTION ("라우터IP 라우터포트 서버IP 서버포트") -> PROXY 한 줄 ("" = 못 만듦 = 보내지 않음)
+func proxyLine(sshConn string) string {
+	f := strings.Fields(sshConn)
+	if len(f) != 4 {
+		return ""
+	}
+	src, err1 := netip.ParseAddr(f[0])
+	dst, err2 := netip.ParseAddr(f[2])
+	_, err3 := strconv.ParseUint(f[1], 10, 16)
+	_, err4 := strconv.ParseUint(f[3], 10, 16)
+	if err1 != nil || err2 != nil || err3 != nil || err4 != nil {
+		return ""
+	}
+	src, dst = src.Unmap(), dst.Unmap()
+	proto := "TCP4"
+	if src.Is6() || dst.Is6() {
+		if src.Is4() || dst.Is4() {
+			return ""
+		}
+		proto = "TCP6"
+	}
+	return fmt.Sprintf("PROXY %s %s %s %s %s\r\n", proto, src, dst, f[1], f[3])
+}
+
+// proxyAllowed : 이 연결이 첫머리에 PROXY 한 줄을 보내도 되는지 = loopback 에서 온 평문 TCP (-rtr-stdio)
+func proxyAllowed(remote, trans string) bool {
+	ap, err := netip.ParseAddrPort(remote)
+	return err == nil && trans == "tcp" && ap.Addr().Unmap().IsLoopback()
+}
+
+// takeProxy : rc.pending 첫머리의 PROXY 한 줄을 읽어 연결의 주소를 라우터 주소로 바꿈 (readPDU 가 부름).
+// done=false : 한 줄이 아직 덜 옴. 첫 바이트가 'P' 가 아니면 보통 RTR (PROXY 없음) -> loopback 주소로 자리를 잡고 done.
+// PROXY 면 연결 자리 (상한 / trusted) 를 라우터 주소로 잡음 (판 올리기로 이어받아 loopback 자리가 있으면 돌려줌)
+func (rc *rtrConn) takeProxy() (done bool, err error) {
+	s := rc.srv
+	if rc.pending[0] != 'P' {
+		rc.proxyOK = false
+		return rc.slotHere()
+	}
+	i := bytes.Index(rc.pending, []byte("\r\n"))
+	if i < 0 {
+		if len(rc.pending) > proxyMaxLine {
+			return false, errors.New("bad PROXY line (too long)")
+		}
+		return false, nil
+	}
+	line := string(rc.pending[:i])
+	rc.pending = append(rc.pending[:0], rc.pending[i+2:]...)
+	rc.proxyOK = false
+	f := strings.Fields(line)
+	if len(f) == 2 && f[0] == "PROXY" && f[1] == "UNKNOWN" { // 주소를 모름 : loopback 그대로
+		return rc.slotHere()
+	}
+	if len(f) != 6 || f[0] != "PROXY" || (f[1] != "TCP4" && f[1] != "TCP6") {
+		return false, fmt.Errorf("bad PROXY line %q", line)
+	}
+	ip, err := netip.ParseAddr(f[2])
+	port, perr := strconv.ParseUint(f[4], 10, 16)
+	if err != nil || perr != nil {
+		return false, fmt.Errorf("bad PROXY line %q", line)
+	}
+	remote := netip.AddrPortFrom(ip.Unmap(), uint16(port)).String()
+	slot, ok := s.take(remote)
+	if !ok {
+		return false, fmt.Errorf("ssh %s: connection limit", remote)
+	}
+	s.Logf("rtr %s: ssh from %s", rc.remote, remote)
+	s.mu.Lock() // remote / trans / slot 은 상태 API (clientsInfo) 가 읽음
+	old := rc.slot
+	rc.remote, rc.trans, rc.slot = remote, "ssh", slot
+	s.mu.Unlock()
+	s.release(old)
+	return true, nil
+}
+
+// slotHere : PROXY 없는 loopback 연결 = 자기 주소로 자리를 잡음 (이미 있으면 그대로)
+func (rc *rtrConn) slotHere() (bool, error) {
+	if rc.slot.taken {
+		return true, nil
+	}
+	slot, ok := rc.srv.take(rc.remote)
+	if !ok {
+		return false, errors.New("connection limit")
+	}
+	rc.srv.mu.Lock()
+	rc.slot = slot
+	rc.srv.mu.Unlock()
+	return true, nil
 }
 
 // relayStdio : in -> c, c -> out 을 옮김. 끝은 RTR 쪽 (c -> out) 이 정함 (11-04 고침)

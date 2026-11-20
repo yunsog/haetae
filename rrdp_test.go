@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 package main
 
 // rrdp_test.go : delta 두 단계 적용 (확인 실패면 폴더를 건드리지 않음), 거대한 요소 차단
@@ -255,5 +257,54 @@ func TestRRDPConditionalGET(t *testing.T) {
 	sync("none")
 	if cond != before || full != 3 {
 		t.Errorf("stale: conditional sent (cond %d -> %d), full %d", before, cond, full)
+	}
+}
+
+// RFC 9697 : 같은 session / serial 인데 지난번에 본 delta 의 해시가 바뀌면 "none" 이 아니라 snapshot 을 다시 받음
+func TestRRDPDeltaHashMutated(t *testing.T) {
+	snap := fmt.Sprintf(`<snapshot xmlns="%s" version="1" session_id="s" serial="1">`+
+		`<publish uri="rsync://h/m/a.roa">%s</publish></snapshot>`, rrdpNS, base64.StdEncoding.EncodeToString([]byte("a")))
+	deltaHash, snapshots := hashHex([]byte("d1")), 0
+	var srv *httptest.Server
+	srv = httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/notification.xml":
+			fmt.Fprintf(w, `<notification xmlns="%s" version="1" session_id="s" serial="1">`+
+				`<snapshot uri="%s/snapshot.xml" hash="%s"/><delta serial="1" uri="%s/d1.xml" hash="%s"/></notification>`,
+				rrdpNS, srv.URL, hashHex([]byte(snap)), srv.URL, deltaHash)
+		case "/snapshot.xml":
+			snapshots++
+			fmt.Fprint(w, snap)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+	f, err := newFetcher(t.TempDir(), 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.Logf, f.client = nil, srv.Client()
+	notify := srv.URL + "/notification.xml"
+	sync := func() string {
+		_, res, err := f.syncRRDP(context.Background(), notify)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return res.Action
+	}
+	if a := sync(); a != "snapshot" {
+		t.Fatalf("first: %q", a)
+	}
+	if a := sync(); a != "none" {
+		t.Fatalf("same hash: %q", a)
+	}
+	deltaHash = hashHex([]byte("d1 changed"))
+	if a := sync(); a != "snapshot" || snapshots != 2 {
+		t.Fatalf("mutated: action %q snapshots %d", a, snapshots)
+	}
+	// 바뀐 해시를 기억했으니 다음은 다시 "none"
+	if a := sync(); a != "none" {
+		t.Fatalf("after: %q", a)
 	}
 }

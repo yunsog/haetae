@@ -8,6 +8,9 @@
 #   -n : 시험 (go test) 건너뜀
 set -e
 cd "$(dirname "$0")/.."
+# 정적 빌드 (11-18, 봉수대와 같게) : libc 를 쓰지 않음 -> apt 의 libc 업데이트 뒤 needrestart 가 해태를 재시작하지 않음 (11-14 RTR 11 초 끊김).
+# GitHub 릴리스 (tools/release_build.sh) 와 같은 방식. DNS 는 Go 자체 해석기 (/etc/resolv.conf, /etc/hosts 그대로 읽음)
+export CGO_ENABLED=0
 if [ "$1" != "-n" ]; then
 	go test -count=1 ./... >/dev/null
 	echo "go test ok"

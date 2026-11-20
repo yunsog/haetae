@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 package main
 
 // valid.go : 직전 정상 publication point (RFC 9286 6.7, 0.2.0)
@@ -26,7 +28,9 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"time"
 )
 
 // validPPDir : CA 하나의 저장 폴더 (공개 키 + notify + manifest URI)
@@ -64,10 +68,40 @@ func storedNumber(dir string) *big.Int {
 	return n
 }
 
-// storeValid : 확인을 통과한 publication point 를 저장 (manifest 가 같으면 그대로 둠)
-// 새 폴더 (dir.tmp) 에 다 만든 뒤 바꿔 끼움 -> 반쯤 쓴 저장본이 없음
+// storedThisUpdate : 저장본 manifest 의 thisUpdate (THISUPDATE 파일, 0.4.0 부터). 없으면 0 = 비교 안 함
+func storedThisUpdate(dir string) time.Time {
+	b, err := os.ReadFile(filepath.Join(dir, "THISUPDATE"))
+	if err != nil {
+		return time.Time{}
+	}
+	n, err := strconv.ParseInt(strings.TrimSpace(string(b)), 10, 64)
+	if err != nil {
+		return time.Time{}
+	}
+	return time.Unix(n, 0)
+}
+
+// mftWentBack : 새 manifest 가 저장본보다 뒤로 갔는지 (RFC 9286 4.2.1 재생 방지 두 가지). "" = 아님
+//   - manifestNumber 가 저장본보다 작음
+//   - thisUpdate 가 저장본보다 앞섬 (prevTU 0 = 저장본에 THISUPDATE 없음, 비교 안 함)
+//
+// 번호 / thisUpdate 가 같은 것은 같은 manifest 를 다시 읽은 것이라 통과
+func mftWentBack(m *rpkiManifest, prevNum *big.Int, prevTU time.Time) string {
+	if m.Number.Cmp(prevNum) < 0 {
+		return fmt.Sprintf("manifest number %s lower than previous %s", m.Number, prevNum)
+	}
+	if !prevTU.IsZero() && m.ThisUpdate.Before(prevTU) {
+		return fmt.Sprintf("manifest thisUpdate %s before previous %s",
+			m.ThisUpdate.UTC().Format(time.RFC3339), prevTU.UTC().Format(time.RFC3339))
+	}
+	return ""
+}
+
+// storeValid : 확인을 통과한 publication point 를 저장 (manifest 가 같고 파일이 온전하면 그대로 둠)
+// 새 폴더 (dir.tmp) 에 다 만들고 파일마다 fsync 한 뒤 바꿔 끼움 -> 반쯤 쓴 저장본도, 정전 뒤 빈 파일도 없음 (B4).
+// 회차당 약 700 폴더 / 2,100 파일 (11-12 운영), fsync 는 모두 약 0.8 초
 func storeValid(dir, mftName string, pp *pubPoint) error {
-	if old, err := os.ReadFile(filepath.Join(dir, mftName)); err == nil && bytes.Equal(old, pp.mftDER) {
+	if old, err := os.ReadFile(filepath.Join(dir, mftName)); err == nil && bytes.Equal(old, pp.mftDER) && validComplete(dir, pp) {
 		return nil // 같은 manifest = 같은 묶음 (나열된 파일은 해시로 묶여 있음)
 	}
 	tmp := dir + ".tmp"
@@ -80,11 +114,11 @@ func storeValid(dir, mftName string, pp *pubPoint) error {
 		if src := pp.paths[name]; src != "" && os.Link(src, dst) == nil {
 			// hard link 원본이 읽은 뒤에 바뀌었을 수 있음 -> 내용이 확인한 것과 같을 때만 (다르면 복사)
 			if b, err := os.ReadFile(dst); err == nil && bytes.Equal(b, data) {
-				return nil
+				return syncPath(dst) // 원본 (RRDP / rsync 캐시) 은 fsync 없이 썼음 -> 같은 inode 를 여기서 내려씀
 			}
 			os.Remove(dst)
 		}
-		return os.WriteFile(dst, data, 0644)
+		return writeFileSync(dst, data, 0644)
 	}
 	err := put(mftName, pp.mftDER)
 	for _, f := range pp.files {
@@ -93,7 +127,13 @@ func storeValid(dir, mftName string, pp *pubPoint) error {
 		}
 	}
 	if err == nil {
-		err = os.WriteFile(filepath.Join(tmp, "NUMBER"), []byte(pp.mft.Number.String()+"\n"), 0644)
+		err = writeFileSync(filepath.Join(tmp, "NUMBER"), []byte(pp.mft.Number.String()+"\n"), 0644)
+	}
+	if err == nil {
+		err = writeFileSync(filepath.Join(tmp, "THISUPDATE"), []byte(strconv.FormatInt(pp.mft.ThisUpdate.Unix(), 10)+"\n"), 0644)
+	}
+	if err == nil {
+		err = syncPath(tmp) // 폴더 안 이름 목록도
 	}
 	if err != nil {
 		os.RemoveAll(tmp)
@@ -107,7 +147,23 @@ func storeValid(dir, mftName string, pp *pubPoint) error {
 		return err
 	}
 	os.RemoveAll(old)
+	syncPath(filepath.Dir(dir)) // 바꿔 끼운 것 (rename) 도 디스크에. 실패해도 옛 저장본 또는 새 저장본 중 하나 = 온전함
 	return nil
+}
+
+// validComplete : 저장본 폴더에 NUMBER 와 manifest 에 나열된 파일이 모두 맞는 크기로 있는지.
+// fsync 전 판에서 정전이 나면 manifest 는 같은데 파일이 비어 있을 수 있음 -> 그때는 다시 저장 (B4)
+func validComplete(dir string, pp *pubPoint) bool {
+	if fi, err := os.Stat(filepath.Join(dir, "NUMBER")); err != nil || fi.Size() == 0 {
+		return false
+	}
+	for _, f := range pp.files {
+		fi, err := os.Stat(filepath.Join(dir, f.Name))
+		if err != nil || fi.Size() != int64(len(f.Data)) {
+			return false
+		}
+	}
+	return true
 }
 
 // cleanValid : 이번 회차에 보지 않은 CA 의 저장본을 지움 (CA 가 없어짐). 모든 TA 가 끝까지 돈 회차에서만 부름

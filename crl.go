@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 package main
 
 // crl.go : CRL (RFC 6487 5)
@@ -44,6 +46,10 @@ func parseCRL(der []byte) (*rpkiCRL, error) {
 	if rl.Number == nil {
 		return nil, fmt.Errorf("CRL number missing")
 	}
+	// RFC 9829 3.1 : CRL Number 는 0 ~ 2^159-1 (값은 쓰지 않고 범위만 봄, CRL 은 manifest 로 고름)
+	if rl.Number.Sign() < 0 || rl.Number.BitLen() > 159 {
+		return nil, fmt.Errorf("CRL number out of range")
+	}
 	if rl.NextUpdate.IsZero() {
 		return nil, fmt.Errorf("CRL nextUpdate missing")
 	}
@@ -54,6 +60,9 @@ func parseCRL(der []byte) (*rpkiCRL, error) {
 	for _, e := range rl.Extensions {
 		if !e.Id.Equal(oidExtAKI) && !e.Id.Equal(oidExtCRLNumber) {
 			return nil, fmt.Errorf("unexpected CRL extension %s", e.Id)
+		}
+		if e.Id.Equal(oidExtCRLNumber) && e.Critical {
+			return nil, fmt.Errorf("CRL number marked critical") // RFC 9829 3.1
 		}
 	}
 

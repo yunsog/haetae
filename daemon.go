@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 package main
 
 // daemon.go : 상주 모드 (4 단계)
@@ -16,10 +18,12 @@ import (
 	"encoding/binary"
 	"fmt"
 	"log"
+	"maps"
 	"net"
 	"net/http"
 	"net/netip"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -32,6 +36,7 @@ import (
 type daemonConfig struct {
 	CacheDir          string
 	TALDir            string
+	Constraints       string // TA constraints 폴더 (constraints.go). 빈 값 = 끔
 	OutDir            string
 	StateDir          string
 	SLURM             string
@@ -65,6 +70,9 @@ type daemonConfig struct {
 	ConfPath          string        // 읽은 설정 파일 (상태 API / 로그용, 없으면 "")
 	DropWarn          float64       // 0.1 = 10 % 넘게 줄면 경고
 	HoldOnDrop        bool
+	CCRMode           string        // CCR 출력 (ccr.go) : off | latest | daily | hourly | cycle
+	CCRKeep           time.Duration // CCR 보관 기간 (0 = 지우지 않음)
+	CCRDir            string        // CCR 보관 폴더 (빈 값 = <OutDir>/ccr)
 
 	// Reload : systemctl reload (SIGHUP) 때 명령줄 + 설정 파일을 다시 읽어 새 값을 만듦 (main.go). nil = reload 안 됨
 	Reload func() (daemonConfig, string, error) `json:"-"`
@@ -125,7 +133,8 @@ type daemon struct {
 	rtrTLSLn    net.Listener
 	rtrTLS      *tls.Config
 	repos       []repoStatus
-	view        *queryView // 조회 API 용 (첫 검증 전에는 nil)
+	view        *queryView          // 조회 API 용 (첫 검증 전에는 nil)
+	mftNames    map[[32]byte]string // 직전 회차의 CA -> manifest URI (RFC 9981 이름 바뀜 알림, 회차 고루틴만 씀)
 	tas         []taInfo
 	hist        []histRun
 	histLines   int // history.jsonl 줄 수
@@ -151,7 +160,10 @@ type daemon struct {
 	gate   chan struct{} // 회차 하나 = 이 자리 하나. 판 올리기는 이것을 잡아 돌던 회차가 끝나길 기다림
 	exe    string        // 시작 때의 실행 파일 경로 (새 판이 같은 경로에 깔림)
 	upBusy atomic.Bool
-	ho     handoverInfo // 상태 API (d.mu)
+	// SIGTERM / SIGINT (watchTerm). termSeen = 받았음 (stopping 보다 먼저, 잠금 없이) : 판 올리기가 exec 직전에 봄 (B5)
+	termCh   chan os.Signal
+	termSeen atomic.Bool
+	ho       handoverInfo // 상태 API (d.mu)
 }
 
 // httpListen : HTTP 주소 하나의 듣기 소켓
@@ -222,6 +234,17 @@ func runDaemon(cfg daemonConfig, once bool, resume string) int {
 		return 1
 	}
 	log.Printf("TAL (%s): %s", source, talSummary(tals))
+	if cfg.Constraints != "" {
+		cs, bad, err := loadConstraints(cfg.Constraints, tals)
+		if err != nil {
+			log.Printf("constraints: %v", err)
+			return 1
+		}
+		log.Printf("constraints (%s): %s", cfg.Constraints, constraintsSummary(cs))
+		for _, e := range bad {
+			log.Printf("WARNING constraints file rejected (not used): %v", e)
+		}
+	}
 
 	d := &daemon{cfg: cfg, st: &store{}, started: time.Now(), confPath: cfg.ConfPath, confAt: time.Now(), lockFile: lf,
 		gate: make(chan struct{}, 1)}
@@ -320,7 +343,9 @@ func runDaemon(cfg daemonConfig, once bool, resume string) int {
 	if have {
 		d.openRTR()
 	}
-	go d.watchReload()      // systemctl reload haetae (SIGHUP) -> 설정 다시 읽음
+	go d.watchReload() // systemctl reload haetae (SIGHUP) -> 설정 다시 읽음
+	d.termCh = make(chan os.Signal, 1)
+	signal.Notify(d.termCh, syscall.SIGTERM, syscall.SIGINT)
 	go d.watchTerm()        // systemctl stop / restart (SIGTERM) -> 정리하고 끝 (ops.go)
 	go d.watchStale()       // 묵은 데이터 경보 / RTR 닫기
 	go d.watchdog()         // systemd WatchdogSec
@@ -501,7 +526,19 @@ func (d *daemon) cycle() {
 	v := newValidator(d.cfg.CacheDir, time.Now(), c.Workers)
 	v.Fetch = d.fetch
 	v.ValidDir = filepath.Join(d.cfg.CacheDir, "valid") // 직전 정상 publication point (valid.go)
+	if err := v.useConstraints(c.Constraints, tals); err != nil {
+		d.skipRun(ri, fmt.Sprintf("%v, keep previous", err))
+		return
+	}
+	v.CCR = c.CCRMode != "" && c.CCRMode != "off"
+	v.PrevMftNames = d.mftNames
 	v.run(tals)
+	// 다음 회차 비교용. TA 가 실패한 회차는 못 본 CA 가 많으니 지우지 않고 본 것만 덮어씀
+	if len(v.failedTA) == 0 || d.mftNames == nil {
+		d.mftNames = v.mftNames
+	} else {
+		maps.Copy(d.mftNames, v.mftNames)
+	}
 	if n := d.fetch.late.Load(); n > 0 {
 		log.Printf("WARNING run deadline %s: %d repositories not fetched (using previous data)", c.FetchDeadline, n)
 	}
@@ -562,7 +599,10 @@ func (d *daemon) cycle() {
 		ri.Unsafe = len(view.Unsafe)
 		if err := v.writeOutputs(d.cfg.OutDir, ri.Start); err != nil {
 			log.Printf("output: %v", err)
+		} else if err := archiveCCR(ccrArchiveDir(c.CCRDir, d.cfg.OutDir), v.ccrDER, c.CCRMode, c.CCRKeep, v.Now); err != nil {
+			log.Printf("WARNING ccr archive: %v", err)
 		}
+		v.ccrDER = nil
 		writeRepoStatusQuiet(d.cfg.OutDir, repos)
 		// 2. 집합 (RTR / json-delta / validity) 과 조회 결과 (objects / ca / as …) 를 한 잠금 안에서 같이 바꿈 :
 		//    API 끼리 다른 회차를 보이는 틈이 없게 (11-02, 전에는 집합을 먼저 바꾸고 출력을 쓴 뒤 몇 초 늦게 view).
@@ -663,6 +703,10 @@ func (d *daemon) buildView() {
 	v := newValidator(d.cfg.CacheDir, time.Now(), c.Workers)
 	v.Fetch = d.fetch
 	v.ValidDir = filepath.Join(d.cfg.CacheDir, "valid")
+	if err := v.useConstraints(c.Constraints, tals); err != nil {
+		log.Printf("handover: lookup data not rebuilt (%v), waiting for the next run", err)
+		return
+	}
 	v.run(tals)
 	v.sortObjects()
 	d.mu.Lock()

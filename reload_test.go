@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 package main
 
 // reload_test.go : systemctl reload (설정 다시 읽기)

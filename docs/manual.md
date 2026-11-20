@@ -9,7 +9,7 @@ and to other systems over an HTTP API.
 | Version | Haetae 0.2.0 |
 | Binary | a single `haetae` executable (Go, standard library only). It does fetching, validation, RTR and the HTTP API |
 | Requirements | Linux, the `rsync` command (fallback when RRDP fails), an accurate system clock (NTP) |
-| Standards | RPKI objects RFC 6487 / 6488 / 3779 / 9582 / 9286 / 8630, RRDP RFC 8182, RTR RFC 6810 / 8210 (+ draft-ietf-sidrops-8210bis for v2), SLURM RFC 8416 |
+| Standards | RPKI objects RFC 6487 / 6488 (+ 9589 signing-time) / 3779 / 9582 / 9286 (+ 9981 manifest numbers) / 8630 (+ 10097 TA tiebreaking) (+ 9829 CRL numbers), RRDP RFC 8182 (+ 9674 same-origin, 9697 desync detection), RTR RFC 6810 / 8210 (+ draft-ietf-sidrops-8210bis-29 for v2), SLURM RFC 8416. Draft revisions followed: 8210bis-29, aspa-profile-31, aspa-verification-29, rpki-ccr-11, rpki-prefixlist-05, aspa-slurm-04, constraining-rpki-trust-anchors-02, prefer-rrdp-02 (checked 2026-11-18) |
 
 This manual assumes you know the basic RPKI concepts. The HTTP API is described in detail in [api.md](api.md).
 
@@ -41,7 +41,7 @@ This manual assumes you know the basic RPKI concepts. The HTTP API is described 
 | ASPA | AS Provider Authorization: "the providers (upstreams) of this AS are these" |
 | Router key | (AS, SKI, public key) from a BGPsec router certificate |
 | TAK | Trust Anchor Key (RFC 9691). An object announcing the next key during a TA key rollover |
-| SLURM | Local exceptions file (RFC 8416): remove VRPs (filters) / add VRPs (assertions) |
+| SLURM | Local exceptions file (RFC 8416): remove (filters) / add (assertions) VRPs and router keys. ASPA entries need `slurmVersion` 2 (draft-ietf-sidrops-aspa-slurm-04): both `aspaFilters` `[{"customerAsn"}]` and `aspaAssertions` `[{"customerAsn", "providerAsns"}]` must be present (they may be empty); providerAsns must be ascending, without duplicates and without the customer. aspa* members in a version 1 file are an error (0.4.0; before, version 1 with keys `customer_asid` / `provider_set`) |
 | session / serial | RTR data version. With the same session after a restart, routers fetch only the changes |
 | Cycle | One round of fetch + validate + apply |
 | Unsafe VRP | A VRP of another CA that overlaps the resources of a rejected CA (a route that may become Invalid if that CA breaks and its more-specific ROAs disappear) |
@@ -56,7 +56,9 @@ This manual assumes you know the basic RPKI concepts. The HTTP API is described 
 sudo useradd --system --home-dir /var/lib/haetae --shell /usr/sbin/nologin haetae
 
 # 2) Build (Go 1.26)
-cd <source directory> && go build -o haetae . && go test ./...
+cd <source directory> && CGO_ENABLED=0 go build -o haetae . && go test ./...
+#    CGO_ENABLED=0 = static build (0.4.0): no libc, so a libc update does not make needrestart restart the service.
+#    Release binaries are built the same way
 #    or download a release binary instead (linux amd64 / arm64, see below)
 
 # 3) Binary / configuration / service
@@ -110,7 +112,7 @@ One option selects the mode. With none of them, Haetae runs as a **daemon** (pro
 |---|---|---|
 | Daemon | `haetae [-c <config>] [options]` | Periodic fetch + validation, RTR, HTTP API. Reads the configuration file |
 | Single cycle | `haetae -t [options]` | Same as the daemon but runs one cycle and exits (no RTR / HTTP). For testing |
-| Offline validation | `haetae -validate -cache <cache> -o <out> [-tal <dir>] [-P <time>] [-fetch]` | Validates once and writes only the output files. `-cache` and `-o` are required (so a production cache is not used by accident). Does not read the configuration file |
+| Offline validation | `haetae -validate -cache <cache> -o <out> [-tal <dir>] [-constraints <dir>] [-P <time>] [-fetch]` | Validates once and writes only the output files. `-cache` and `-o` are required (so a production cache is not used by accident). Does not read the configuration file |
 | Parse | `haetae -parse <file\|dir> [-fail <list>]` | Parses objects only (list of failures) |
 | RSC check | `haetae -rsc <x.sig> [-cache <cache>] [file ...]` | Checks an RSC (RFC 9323) signature and the file hashes |
 | RTR over SSH | `haetae -rtr-stdio 127.0.0.1:3323` | Connects stdin/stdout to RTR (run by an sshd subsystem, section 7.4) |
@@ -129,6 +131,8 @@ Value ranges given in parentheses are checked at start and on reload: an out-of-
 | `-state` | `/var/lib/haetae/state` | `paths.state` | restart | State directory (includes the lock: two instances cannot use the same directory). At start-up the directory is set to 0750 and the lock file to 0600, so other accounts cannot hold the lock and block the next restart |
 | `-tal` | (empty = the 5 built-in TALs) | `paths.tal` | next cycle | TAL directory (`*.tal`). Only for emergency RIR key rollovers (section 7.6) |
 | `-slurm` | (none) | `paths.slurm` | next cycle | SLURM file (if it is broken, that cycle is not applied) |
+| `-ccr` / `-ccr-keep` / `-ccr-dir` | off / 168h / (empty = `<out>/ccr`) | `ccr.mode` / `ccr.keep` / `ccr.dir` | next cycle | CCR output and archive (0.4.0, section 8.3). mode = off \| latest \| daily \| hourly \| cycle |
+| `-constraints` | (empty = off) | `paths.constraints` | next cycle | TA constraints directory (`<TAL name>.constraints`, 0.4.0, section 7.6). If the directory cannot be read, the cycle is skipped |
 
 **Fetching / validation**
 
@@ -204,6 +208,12 @@ out   = /var/lib/haetae/out          # (restart)
 state = /var/lib/haetae/state        # (restart)
 tal   =                              # empty = built-in TALs
 slurm =                              # empty = none
+constraints =                        # empty = off (TA constraints directory, section 7.6)
+
+[ccr]
+mode = off                           # off | latest | daily | hourly | cycle (section 8.3)
+keep = 168h                          # archive retention (0 = keep forever)
+dir  =                               # empty = <out>/ccr
 
 [fetch]
 interval = 10m
@@ -267,6 +277,9 @@ Apply the same sources in the host firewall, so access is limited in two layers.
    - Conditional GET: the ETag / Last-Modified of the last fully applied notification file is stored with the RRDP state and
      sent as `If-None-Match` / `If-Modified-Since`; a 304 answer means nothing changed (result `none`). At least once an hour
      the file is fetched unconditionally
+   - Session desynchronisation (0.4.0, RFC 9697): the delta hashes of the last fully applied notification file (the latest 300) are
+     stored with the RRDP state. If a previously seen serial shows a different hash in the same session, Haetae logs
+     `WARNING rrdp <notify>: delta <serial> hash changed in session ... (RFC 9697 desync), taking snapshot` and fetches the snapshot
    - If RRDP keeps failing for a certain time (1 hour; 3 hours for large repositories with 10,000 or more objects), rsync is
      used instead; if both fail, the previously fetched data is used (within the manifest validity, usually about a day).
      Large repositories wait longer on purpose: their rsync modules rarely finish within the 5-minute limit, and when all RPs fall
@@ -292,6 +305,10 @@ Apply the same sources in the host firewall, so access is limited in two layers.
    - If the saved RRDP state exists but its directory is missing (e.g. a crash during a snapshot swap), a fresh snapshot is fetched
    - A downloaded TA certificate is checked against the TAL key (self-signed CA, same key, valid signature) before it
      replaces the cached one; a wrong file from the server never removes a good cached TA
+   - TA tiebreaking (RFC 10097, 0.4.0): a downloaded TA certificate that is not currently valid, or is older than the
+     cached one (earlier notBefore; same notBefore and longer validity), does not replace it. The log line
+     `TA <name>: ... is older than cached TA ..., keeping cached copy (RFC 10097)` may mean an old TA certificate was
+     replayed on the path; check it. An expired cached TA is always replaced
    - An empty snapshot (no objects) still replaces the directory. An rsync module larger than 2,000,000 files or 4 GB is
      removed and counted as failed (while it is being fetched, the 5-minute limit bounds it)
    - A delta that cannot be fetched because of a network problem (connect / timeout / 5xx / 429 / cut off) does not trigger a
@@ -320,7 +337,14 @@ Apply the same sources in the host firewall, so access is limited in two layers.
      `manifest failed, using previous valid publication point` is counted in `summary.txt` / `last_run.counts`
    - A manifest number lower than the stored one is treated as a failure (rollback protection, RFC 9286 section 4.2.1),
      unless the stored copy is no longer valid (for example expired): then the new manifest is accepted, so a CA that was
-     re-created with numbering from the start comes back (warning `manifest number went back, previous copy no longer valid: accepted`)
+     re-created with numbering from the start comes back (warning `manifest went back, previous copy no longer valid: accepted`;
+     before 0.4.0 `manifest number went back, ...`). Since 0.4.0 a thisUpdate earlier than the stored one is treated the same way
+     (RFC 9286 section 4.2.1). Stored copies made before 0.4.0 have no `THISUPDATE` file and are compared by number only until the manifest changes
+   - Manifest filename changes (RFC 9981, 0.4.0): when the last segment of a CA's manifest URI changes, the manifest number
+     starts over (stored copies are kept per manifest URI) and the warning `manifest filename changed, manifest number reset (RFC 9981)`
+     is counted (example = old URI -> new URI). The comparison is in memory between cycles, so the first cycle after a restart or upgrade skips it
+   - A manifest whose EE signedObject differs from the manifest location is a failed fetch: the previous valid copy is used
+     (RFC 9981 section 4; before 0.4.0 only a warning)
    - Stored copies of CAs not seen in a cycle are removed, only when all TAs completed (log `valid: removed N stale publication points`)
    - Daemon (and `-t`) mode only. `-validate` (offline comparison) does not use it, like `rpki-client -n`.
      Tested on a real snapshot with an empty repository cache: all 55,828 publication points fell back and the
@@ -347,6 +371,10 @@ The drop check compares against a previous result and does not apply to the firs
 - At start-up: configuration -> TAL check (Haetae does not start if a TAL is broken) -> `state/payload.gob`
   (the set served over RTR after SLURM, session, serial and the last 200 deltas; about 1.6 s and 44 MB for about 1M VRPs)
 - `payload.gob` is written atomically (temporary file, fsync, rename) after every applied cycle, so set, session, serial and deltas always belong to the same cycle
+- Power loss (0.4.0): every file that is replaced by rename is flushed to disk (fsync) first: `payload.gob`, `state.json`, output files, run history, RRDP state and
+  the **last valid publication points** (`cache/valid`, every file and the directory). A saved publication point is written again if a file is
+  missing or has the wrong size, even when the manifest is the same. Fetched RRDP / rsync objects are not flushed one by one
+  (a snapshot has hundreds of thousands); if one is damaged, the manifest hash check fails and the last valid copy is used
 - If the saved set is within `max-start-age` (2 hours), **RTR is opened immediately** -> routers reconnect with the same session and fetch only the changes
 - If `payload.gob` is older than that or unreadable, a new session (always different from the old one) is created and RTR is opened after the first applied cycle (routers fetch everything again)
 - Upgrade from a version before 0.2.0: since 0.3.0 the older state files (`state.json` + `out/json` + `deltas.gob`) are no longer read,
@@ -368,7 +396,7 @@ Re-reads only the configuration while running (not a restart: RTR sessions, the 
 | `rtr.allow`, `http.allow`, `http.public` | Next connection / request. RTR closes connections that are no longer in the list at once |
 | `validation.stale-warn`, `rtr.stale-close` | Next stale check (within 1 minute) |
 | `rtr.refresh / retry / expire` | Next End of Data |
-| `fetch.*`, `validation.workers / drop-warn / hold-drop`, `paths.tal / slurm` | Next cycle |
+| `fetch.*`, `validation.workers / drop-warn / hold-drop`, `paths.tal / slurm / constraints`, `ccr.*` | Next cycle |
 | `http.jsonext`, `http.delta-full-interval` | Next request |
 | `rtr-tls.cert / key / ca` | Next TLS connection (certificate rotation) |
 
@@ -441,6 +469,9 @@ executes the new file, so for systemd nothing happens (no restart; the watchdog 
 - On failure in steps 1–5 (including a failed exec) everything is undone and the old binary keeps running (log
   `handover: aborted ...`, status `handover.last_error`). If the new binary cannot read the state file it exits and
   systemd restarts it, which is the same as a restart
+- `systemctl stop` / `restart` (SIGTERM) during an upgrade (0.4.0): right before exec Haetae checks whether a stop was requested;
+  if so it aborts the upgrade and exits (`handover: aborted ... stopping (SIGTERM during handover)`). A SIGTERM after that check ends the
+  process at once. Before 0.4.0 a SIGTERM just before exec could be lost, and the new binary kept running until systemd killed it
 - The new binary reads the configuration again; the listening addresses (`rtr.listen`, `rtr-tls.listen`, `http.listen`)
   keep the inherited sockets (changing them needs a restart)
 - **The running binary must support this.** A binary without it is terminated by SIGUSR2 (systemd restarts it after
@@ -452,7 +483,7 @@ It assumes the unit `haetae` and the binary at `/usr/local/bin/haetae`. The same
 over the old one, then the running process is told to hand over):
 
 ```
-go build -o haetae . && go test ./...
+CGO_ENABLED=0 go build -o haetae . && go test ./...
 sudo install -m 755 haetae /usr/local/bin/haetae
 sudo systemctl kill -s USR2 --kill-whom=main haetae
 journalctl -u haetae -f      # wait for "handover: resumed ..." (or "handover: aborted ...")
@@ -566,7 +597,12 @@ Match User rpki-rtr
     X11Forwarding no
     PermitTTY no
 ```
-- To Haetae these connections come from 127.0.0.1 (included in the default `rtr.allow`; `rtr_clients` shows 127.0.0.1)
+- To Haetae these connections come from 127.0.0.1 (included in the default `rtr.allow`)
+- Router addresses (0.4.0): `-rtr-stdio` sends one PROXY line (HAProxy PROXY protocol v1, text) built from `SSH_CONNECTION` at the start of the
+  connection. Haetae accepts it **only as the first bytes of a plain TCP connection from loopback**, and then counts the connection under the
+  router's real address (per-address limit, `rtr.trusted`, `rtr_clients[].remote`, transport `ssh`). A connection from the Internet that sends
+  it is closed as a bad PDU, so the address cannot be forged from outside (local accounts on the server could forge it).
+  Before 0.4.0 all SSH routers appeared as 127.0.0.1 and the fifth one hit the per-address limit (4)
 - Restrict which routers may log in at the sshd level (firewall for port 22, `AllowUsers`, keys instead of passwords where the router supports it)
 - If the router closes only its sending side (EOF), `-rtr-stdio` still passes Haetae's response through to the end before it exits (0.3.0)
 
@@ -594,11 +630,20 @@ Some routers prefer their own configured values. v0 has no such fields.
   When you see it, update the TAL as above (Haetae does not switch keys by itself). The warning stops once the TAK names the new key as current.
   A TAK issued by a non-TA CA, or whose current key is not the TA key, is ignored (warning `TAK not signed by TA key (ignored)`)
 
-**TA constraints are not used (for now).** rpki-client can limit the resources each TA may certify with local `*.constraints` files
-derived from IANA / RIR allocation data. The mechanism is described in draft-ietf-sidrops-constraining-rpki-trust-anchors,
-an IETF SIDROPS working group draft (not yet an RFC). The files are local configuration and must follow allocation changes:
-in 2026-10 the copy shipped in a 2024 distribution package rejected valid ROAs and ASPAs for a block allocated later,
-while the current files gave no difference. Haetae does not implement constraints yet; this will be revisited when the draft becomes an RFC.
+**TA constraints (optional, off by default, 0.4.0)**: draft-ietf-sidrops-constraining-rpki-trust-anchors-02 (an IETF SIDROPS
+working group draft, not yet an RFC). A local file per TA lists the resources that TA is expected to certify; objects listing other
+resources are rejected (the TA is trusted, but only within that scope).
+- Turn on: `paths.constraints = <dir>` (option `-constraints`) -> `systemctl reload` (from the next cycle). Empty = off
+- The directory holds `<TAL name>.constraints` (`afrinic`, `apnic`, `arin`, `lacnic`, `ripe`); a TA without a file is not checked.
+  The format is the one OpenBSD (rpki-client) ships: `allow` / `deny` followed by a prefix, an address range `a - b`, an AS or an AS range; `#` comments
+- Checks (same as rpki-client 9.9): the resources **listed** in the EE certificates of ROAs, ASPAs and SPLs and in BGPsec router certificates
+  (inherit is not checked). Overlap with a deny entry rejects. If there are allow entries (IP and AS separately), the resources must lie within them
+  (an address family without allow entries is rejected)
+- A rejection reads `resource violates apnic.constraints: 2410:7000::/20` in rejects.txt. A file with an invalid line is not used at all
+  (warning `constraints file rejected (not used)` in summary / status; that TA is validated without constraints). The files in use are logged at start
+- **The files must follow allocation changes.** In 2026-10 the copy shipped in a 2024 distribution package rejected 2,773 valid ROAs and 59 ASPAs
+  for a block allocated later (current files: no difference). Before turning it on, decide who updates the files and how
+  (the draft, section 5, suggests assuming a six month delay for files distributed with software packages)
 
 ---
 
@@ -632,17 +677,36 @@ while the current files gave no difference. Haetae does not implement constraint
 | Objects / CAs / expiring | `/api/v1/objects`, `/api/v1/ca?uri=`, `/api/v1/expiring?days=30` |
 | Unsafe / exceptions / repositories / rejects | `/api/v1/unsafe`, `/api/v1/slurm`, `/repos.json`, `/rejects.txt` |
 | Trends | `/api/v1/history?hours=48`, `/metrics` (Prometheus) |
-| Full files (large) | `/json`, `/csv`, `/objects.jsonl`, `/jsonext` (optional) |
+| Full files (large) | `/json`, `/csv`, `/objects.jsonl`, `/rpki.ccr` (internal only), `/jsonext` (optional) |
 
 ### 8.3 Output files (`/var/lib/haetae/out`, rewritten every cycle)
 | File | Size (2026-10) | Content |
 |---|---|---|
-| `json` | about 107 MB | VRPs + ASPA + router keys + statistics (rpki-client format) |
+| `json` | about 107 MB | VRPs + ASPA + router keys + statistics (rpki-client format). The metadata carries the CCR state hashes `ccr_*_hash` (0.4.0) |
+| `rpki.ccr` | about 25 MB | CCR (below, 0.4.0, when `ccr.mode` is not off) |
 | `csv` | about 45 MB | ASN, prefix, maxLength, TA, expiry |
 | `objects.jsonl` | about 360 MB | Every validated object (one per line: type, URI, SHA-256, validity period, status, content summary) |
 | `rejects.txt` | small | Rejected objects and reasons |
 | `repos.json` | small | Fetch result per repository |
 | `summary.txt` | small | Counts per type, warning counts with examples |
+
+**CCR (`rpki.ccr`, 0.4.0)**: draft-ietf-sidrops-rpki-ccr-11 (Canonical Cache Representation). The validated cache state (current manifests,
+VRPs, ASPAs, TAs, router keys) in a fixed DER form. **Given the same input, every RP produces the same bytes**, so RPs can be compared.
+Each state has a SHA-256 hash, so comparing `ccr_mfts_hash` / `ccr_vrps_hash` / `ccr_vaps_hash` / `ccr_tas_hash` / `ccr_brks_hash` in `json`
+(base64, the same names as rpki-client 9.9) is enough. **Turned on by configuration** (`[ccr] mode`; default off = not written, no json hashes, no `/rpki.ccr`, an old rpki.ccr is removed).
+`latest` rewrites `out/rpki.ccr` on every applied cycle; `daily` / `hourly` / `cycle` also archive
+`<ccr.dir>/YYYYMMDD/rpki-YYYYMMDDTHHMMSSZ.ccr.gz` (first applied cycle of the UTC day / hour, or every applied cycle) and delete archives older
+than `ccr.keep` (default 168h; about 12 MB per gzip file, about 1.7 GB per day for `cycle`). rpki-client 9.9 always writes one rpki.ccr.
+`producedAt` = the validation time (`-P`). Not a signed object.
+- On a 2026-10 repository snapshot, Haetae's rpki.ccr matches rpki-client 9.9's (`-n -P` with the same time) in the manifest, VRP, TA and
+  router key states; only the ASPA state differs, because of AS0 (below). Manifest locations are the signedObject entries of the EE SIA only
+
+**Merging ASPAs and AS0 (0.4.0)**: when a customer AS has several ASPAs, the providers are merged (U-SPAS) and AS0 ("no providers") is removed
+if other providers are present (aspa-profile-31 section 5.2, aspa-verification-29, CCR draft section 3.4.3; under 8210bis-29 a router rejects an
+ASPA PDU that mixes AS0 with other providers with Error Code 9). This applies to RTR, json, the lookup API and CCR. Up to 0.3.0 AS0 was kept
+(a real case: AS59182 with an ASPA [0] from a sub-CA and [9885, 55824] from its parent gave [0, 9885, 55824]).
+**Routinator 0.16.1 removes AS0 as Haetae does; rpki-client 9.9 keeps it.** In comparisons with rpki-client, ASPA differences for such
+customers (in 2026-11 only AS59182) come from this
 
 ### 8.4 Load protection
 | Target | Protection |
@@ -674,12 +738,15 @@ Use `journalctl -u haetae`. Main lines (in version 0.2.0 some messages are still
 | cycle | `run 1m12s: vrps 1030362 vaps 3925 keys 3 +4 -1 serial 142 repos map[...] 13MB applied=true` | Cycle summary (duration, counts, added / removed, repository results, bytes fetched, applied or not) |
 | cycle | `WARNING run deadline 20m0s: 37 repositories not fetched (using previous data)` | Repositories skipped because of the fetch deadline (6.1) |
 | cycle | `WARNING low disk: 8123 MB free under /var/lib/haetae/cache (< 10240 MB), new repositories are not fetched` | Low disk space (6.1) |
+| cycle | `WARNING rrdp https://.../notification.xml: delta 4512 hash changed in session ... (RFC 9697 desync), taking snapshot` | The repository server changed a delta it had already published (RFC 9697). Haetae re-syncs that repository from the snapshot; no action needed |
 | cycle | `cache: removed 3 repositories unused for 72h0m0s` | Cleanup of unused repository directories (6.1) |
 | cycle | `slow run 10m25s: slowest repos https://.../notification.xml rrdp ok 5m0s, ...` | Cycle longer than 3 minutes: the five repositories that took longest to fetch (over 1 s only, longest first). `(none over 1s, ...)` means validation was slow |
 | cycle | `... applied=false TA failed [...], keep previous` / `WARNING VRP drop ...` | Not applied / drop warning (6.2) |
 | cycle | `WARNING TA key rollover announced (TAK, update TAL): ...` | A TA announced its next key; update the TAL (7.6) |
-| cycle | `run skipped: SLURM /etc/haetae/slurm.json: ..., keep previous (serial 401)` | Cycle skipped because of a TAL / SLURM error (6.2) |
+| cycle | `run skipped: SLURM /etc/haetae/slurm.json: ..., keep previous (serial 401)` | Cycle skipped because of a TAL / SLURM / constraints directory error (6.2) |
+| start | `constraints (/etc/haetae/constraints): apnic.constraints, ...` / `WARNING constraints file rejected (not used): ...` | TA constraints files in use / not usable (7.6) |
 | RTR | `rtr 192.0.2.1:51234: connected (tcp)`, `not in allow list, closed` | Router connected / refused |
+| RTR | `rtr 127.0.0.1:41552: ssh from 192.0.2.7:51234` | Real address of an SSH router (`-rtr-stdio`, 0.4.0); later lines use it. `bad PROXY line ...` = closed |
 | RTR | `rtr 192.0.2.1:51234: error report from router: code 2, PDU type 1 (v1), text "..."` | Error Report from the router (code, offending PDU, text); the connection is closed |
 | stale | `WARNING stale data: set built 1h10m0s ago (stale-warn 1h0m0s)` | The served set is older than `stale-warn` (on change and every 30 minutes, 6.5) |
 | stale | `stale data cleared (set built 2m0s ago)` | A newer set was applied |
@@ -703,7 +770,7 @@ Use `journalctl -u haetae`. Main lines (in version 0.2.0 some messages are still
 |---|---|
 | View status | `systemctl status haetae`, `curl -s localhost:8323/status` |
 | Change configuration | Edit the configuration file, `sudo systemctl reload haetae` -> check the log. For restart-only items use `restart` |
-| Install a new version | `tools/upgrade.sh` = seamless upgrade with SIGUSR2 (6.7). Otherwise `go build -o haetae .` -> `sudo install -m 755 haetae /usr/local/bin/haetae` -> `sudo systemctl restart haetae` (about 5 s pause, routers reconnect with the same session). If `deploy/haetae.service` changed, install it too and run `systemctl daemon-reload` first (6.6) |
+| Install a new version | `tools/upgrade.sh` = seamless upgrade with SIGUSR2 (6.7). Otherwise `CGO_ENABLED=0 go build -o haetae .` -> `sudo install -m 755 haetae /usr/local/bin/haetae` -> `sudo systemctl restart haetae` (about 5 s pause, routers reconnect with the same session). If `deploy/haetae.service` changed, install it too and run `systemctl daemon-reload` first (6.6) |
 | Health check | `curl -s -o /dev/null -w '%{http_code}' localhost:8323/healthz` (200 = ok, 503 = see chapter 11) |
 | Enable RTR fail-over | `rtr.stale-close = 2h` (for example) -> reload; only if routers have another RP (6.5) |
 | Add a router | Add its address to `rtr.allow` -> reload; also allow it in the firewall (RTR port) |
@@ -711,6 +778,25 @@ Use `journalctl -u haetae`. Main lines (in version 0.2.0 some messages are still
 | Local exceptions | Write a SLURM file -> `paths.slurm` -> reload (from the next cycle) |
 | RIR TA key rollover | Section 7.6 |
 | Enable drop protection | `validation.hold-drop = true` -> reload |
+
+### 10.1 Grafana (0.4.0)
+
+Samples are in `deploy/grafana/`:
+
+| File | Contents |
+|---|---|
+| `prometheus.yml` | Scrape job example (job `haetae`, every minute); add it to `scrape_configs` of Prometheus |
+| `haetae_alerts.yml` | Alert rule examples: target down, data older than 1 hour, RTR closed, runs not applied, newly failing repository (6 runs in a row, fine 1 day before), VRPs down more than 10 % in 1 hour |
+| `haetae_dashboard.json` | Grafana dashboard (Dashboards -> New -> Import, choose the Prometheus data source): version / VRPs / data age / RTR / failing repositories, served set, VRPs per TA, rejected objects, warnings / unsafe VRPs, repository results and a table of failing repositories, run duration / bytes / runs not applied, RTR clients by version / queries / refused, HTTP requests, memory, uptime / upgrades |
+
+Steps:
+1. Put the Prometheus server address in `http.allow` and reload (`/metrics` is internal only; public addresses get 403). Open the HTTP port to it in the firewall
+2. Add the job of `prometheus.yml` to the Prometheus configuration (`targets` = Haetae HTTP address), reload Prometheus, and check that `haetae` is UP in Targets
+3. Import `haetae_dashboard.json` in Grafana. With several Haetae servers, the `instance` label tells them apart (Instance selector at the top)
+4. (Optional) add `haetae_alerts.yml` to `rule_files` of Prometheus
+
+The metric list is in [api.md](api.md) (GET /metrics). Counters (`*_total`) start from 0 at process start and after a seamless upgrade (`rate()` / `increase()` handle that); per-repository failures and last success also count from process start.
+On the Internet a few repositories are always dead for weeks, so alert on newly failing repositories and on data age rather than on the number of failing repositories.
 
 ---
 
@@ -747,6 +833,8 @@ Use `journalctl -u haetae`. Main lines (in version 0.2.0 some messages are still
 | `paths.state` | `-state` | | `rtr.auth` | `-rtr-auth` |
 | `paths.tal` | `-tal` | | `rtr.refresh` | `-rtr-refresh` |
 | `paths.slurm` | `-slurm` | | `rtr.retry` | `-rtr-retry` |
+| `paths.constraints` | `-constraints` | | `ccr.mode` | `-ccr` |
+| `ccr.keep` | `-ccr-keep` | | `ccr.dir` | `-ccr-dir` |
 | `fetch.interval` | `-interval` | | `rtr.expire` | `-rtr-expire` |
 | `fetch.jobs` | `-fetch-j` | | `rtr-tls.listen` | `-rtr-tls` |
 | `fetch.deadline` | `-fetch-deadline` | | | |

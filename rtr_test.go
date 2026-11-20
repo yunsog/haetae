@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 package main
 
 // rtr_test.go : RTR 서버를 띄우고 작은 클라이언트로 주고받기 확인
@@ -9,10 +11,30 @@ import (
 	"log"
 	"net"
 	"net/netip"
+	"sync"
 	"syscall"
 	"testing"
 	"time"
 )
+
+// testLogf : 서버 goroutine 에 줄 로그 함수. 시험이 끝난 뒤 늦게 오는 로그 (끊긴 연결 등) 는 버림
+// (t.Logf 를 그대로 주면 시험 끝과 겹칠 때 -race 가 경쟁으로 잡음, 11-17 TestRTRProxyLine)
+func testLogf(t *testing.T) func(string, ...any) {
+	var mu sync.Mutex
+	done := false
+	t.Cleanup(func() {
+		mu.Lock()
+		done = true
+		mu.Unlock()
+	})
+	return func(format string, a ...any) {
+		mu.Lock()
+		defer mu.Unlock()
+		if !done {
+			t.Logf(format, a...)
+		}
+	}
+}
 
 func mkSet(vrps []rtrVRP, aspa map[uint32][]uint32) *payloadSet {
 	p := &payloadSet{VRPs: map[rtrVRP]bool{}, Keys: map[rtrKey]bool{}, ASPAs: map[uint32][]uint32{}}
@@ -36,9 +58,12 @@ type pdu struct {
 	body     []byte
 }
 
+// readWait : PDU 하나를 기다리는 시간. 큰 집합 시험은 늘림 (-race 에서 60 만 VRP 를 준비하는 동안 첫 PDU 가 3 초를 넘김, 11-18)
+var readWait = 3 * time.Second
+
 func readPDU(t *testing.T, c net.Conn) pdu {
 	t.Helper()
-	c.SetReadDeadline(time.Now().Add(3 * time.Second))
+	c.SetReadDeadline(time.Now().Add(readWait))
 	h := make([]byte, 8)
 	if _, err := io.ReadFull(c, h); err != nil {
 		t.Fatalf("read: %v", err)
@@ -183,7 +208,7 @@ func TestErrorReportDetail(t *testing.T) {
 func TestRTRLimits(t *testing.T) {
 	st := &store{Session: 77}
 	st.update(mkSet([]rtrVRP{vr("10.0.0.0/8", 24, 65001)}, nil))
-	srv := &rtrServer{St: st, Refresh: 600, Retry: 300, Expire: 7200, Logf: t.Logf, MaxPerIP: 1,
+	srv := &rtrServer{St: st, Refresh: 600, Retry: 300, Expire: 7200, Logf: testLogf(t), MaxPerIP: 1,
 		Allow: []netip.Prefix{netip.MustParsePrefix("127.0.0.0/8")}}
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -201,11 +226,12 @@ func TestRTRLimits(t *testing.T) {
 	if n := readUntilEOD(t, c1); n[pduEndOfData] != 1 {
 		t.Fatalf("first full: %v", n)
 	}
-	// 같은 주소 두 번째 연결 : 바로 끊김
+	// 같은 주소 두 번째 연결 : 끊김. loopback 평문은 첫 바이트 (PROXY 인지) 를 본 뒤 자리를 잡음 (B8) -> 질의를 보내면 끊김
 	c2, err := net.Dial("tcp", ln.Addr().String())
 	if err != nil {
 		t.Fatal(err)
 	}
+	c2.Write(query(1, pduResetQuery, 0, nil))
 	c2.SetReadDeadline(time.Now().Add(2 * time.Second))
 	if _, err := c2.Read(make([]byte, 1)); err != io.EOF {
 		t.Errorf("second connection not closed: %v", err)
@@ -271,7 +297,7 @@ func TestDeltaSorted(t *testing.T) {
 // trusted 와 공개의 자리 셈 (11-05 검토 8) : trusted 는 같은 /64 에 많아도 주소당 상한 없음 + 공개 쪽 상한과 따로,
 // 공개 쪽은 /64 마다 MaxPerIP, /48 마다 rtrMaxPer48, 공개 합 MaxConns
 func TestRTRTrustedSlots(t *testing.T) {
-	srv := &rtrServer{Logf: t.Logf, MaxConns: 2, MaxPerIP: 1, TrustedMax: 10,
+	srv := &rtrServer{Logf: testLogf(t), MaxConns: 2, MaxPerIP: 1, TrustedMax: 10,
 		Trusted: []netip.Prefix{netip.MustParsePrefix("2001:db8:1::/64"), netip.MustParsePrefix("192.0.2.9/32")}}
 	var held []rtrSlot
 	take := func(remote string, want bool) {
@@ -320,7 +346,7 @@ func TestRTRTrustedSlots(t *testing.T) {
 
 // 주소마다 1 분에 rtrFullPerClient 번 (11-05 검토 7 : 다시 붙어서 연결마다 제한을 피함)
 func TestRTRFullPerClient(t *testing.T) {
-	srv := &rtrServer{Logf: t.Logf}
+	srv := &rtrServer{Logf: testLogf(t)}
 	for i := 0; i < rtrFullPerClient; i++ {
 		if !srv.allowFull("a") {
 			t.Fatalf("full %d refused", i+1)
@@ -342,14 +368,15 @@ func TestRTRFullPerClient(t *testing.T) {
 func TestRTRPauseCutsNonReader(t *testing.T) {
 	old := rtrPauseWrite
 	rtrPauseWrite = 500 * time.Millisecond
-	defer func() { rtrPauseWrite = old }()
+	readWait = 30 * time.Second
+	defer func() { rtrPauseWrite, readWait = old, 3*time.Second }()
 	var vs []rtrVRP
 	for i := 0; i < 600000; i++ { // 약 12 MB : 서버 보내기 버퍼 (최대 약 4 MB) 보다 큼
 		vs = append(vs, vr(fmt.Sprintf("%d.%d.%d.0/24", 10+i/65536, (i/256)%256, i%256), 24, uint32(64512+i%1000)))
 	}
 	st := &store{Session: 5}
 	st.update(mkSet(vs, nil))
-	srv := &rtrServer{St: st, Refresh: 600, Retry: 300, Expire: 7200, Logf: t.Logf,
+	srv := &rtrServer{St: st, Refresh: 600, Retry: 300, Expire: 7200, Logf: testLogf(t),
 		Allow: []netip.Prefix{netip.MustParsePrefix("127.0.0.0/8")}}
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -385,5 +412,157 @@ func TestRTRPauseCutsNonReader(t *testing.T) {
 	}
 	if len(parked) != 1 {
 		t.Errorf("parked %d, want 1 (idle only)", len(parked))
+	}
+}
+
+// B7 : serial 은 RFC 1982 로 비교 (한 바퀴 넘어가도)
+func TestSerialLE(t *testing.T) {
+	for _, c := range []struct {
+		a, b uint32
+		want bool
+	}{
+		{1, 1, true}, {1, 2, true}, {2, 1, false},
+		{0xffffffff, 0, true}, {0xfffffff0, 5, true}, {5, 0xfffffff0, false}, // 끝에서 0 으로 넘어감
+		{0, 0x7fffffff, true}, {0x7fffffff, 0, false},
+	} {
+		if got := serialLE(c.a, c.b); got != c.want {
+			t.Errorf("serialLE(%#x, %#x) = %v", c.a, c.b, got)
+		}
+	}
+}
+
+// B8 : -rtr-stdio (SSH) 가 보내는 PROXY 한 줄 = 라우터의 실제 주소로 상한 / 표시. loopback 에서 온 것만 받음
+func TestRTRProxyLine(t *testing.T) {
+	if got := proxyLine("192.0.2.7 51234 203.0.113.14 22"); got != "PROXY TCP4 192.0.2.7 203.0.113.14 51234 22\r\n" {
+		t.Errorf("proxyLine v4 %q", got)
+	}
+	if got := proxyLine("2001:db8::7 51234 2001:db8::1 22"); got != "PROXY TCP6 2001:db8::7 2001:db8::1 51234 22\r\n" {
+		t.Errorf("proxyLine v6 %q", got)
+	}
+	for _, bad := range []string{"", "192.0.2.7 51234", "x 1 y 2", "192.0.2.7 51234 2001:db8::1 22", "192.0.2.7 99999 192.0.2.1 22"} {
+		if got := proxyLine(bad); got != "" {
+			t.Errorf("proxyLine(%q) = %q", bad, got)
+		}
+	}
+	if !proxyAllowed("127.0.0.1:5000", "tcp") || !proxyAllowed("[::1]:5000", "tcp") ||
+		proxyAllowed("192.0.2.1:5000", "tcp") || proxyAllowed("127.0.0.1:5000", "tls") {
+		t.Error("proxyAllowed")
+	}
+
+	st := &store{Session: 77}
+	st.update(mkSet([]rtrVRP{vr("10.0.0.0/8", 24, 65001)}, nil))
+	srv := &rtrServer{St: st, Refresh: 600, Retry: 300, Expire: 7200, Logf: testLogf(t), MaxPerIP: 1,
+		Allow: []netip.Prefix{netip.MustParsePrefix("127.0.0.0/8")}}
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	go srv.serve(ln)
+	dial := func(proxy string) net.Conn {
+		c, err := net.Dial("tcp", ln.Addr().String())
+		if err != nil {
+			t.Fatal(err)
+		}
+		// PROXY 와 질의를 한 번에 (한 패킷) 보내도 나눠 읽음
+		c.Write(append([]byte(proxy), query(1, pduResetQuery, 0, nil)...))
+		return c
+	}
+	// 주소당 1 개인데 SSH 라우터 둘 (모두 127.0.0.1 에서 옴) = 실제 주소가 달라 둘 다 됨
+	a := dial(proxyLine("192.0.2.7 51234 192.0.2.1 22"))
+	defer a.Close()
+	b := dial(proxyLine("192.0.2.8 51234 192.0.2.1 22"))
+	defer b.Close()
+	for _, c := range []net.Conn{a, b} {
+		if n := readUntilEOD(t, c); n[pduEndOfData] != 1 {
+			t.Fatalf("ssh router: %v", n)
+		}
+	}
+	got := map[string]string{}
+	for _, ci := range srv.clientsInfo() {
+		got[ci.Remote] = ci.Transport
+	}
+	if got["192.0.2.7:51234"] != "ssh" || got["192.0.2.8:51234"] != "ssh" {
+		t.Errorf("clients %v", got)
+	}
+	// 같은 라우터 주소 두 번째 = 주소당 상한
+	c := dial(proxyLine("192.0.2.7 60000 192.0.2.1 22"))
+	defer c.Close()
+	c.SetReadDeadline(time.Now().Add(2 * time.Second))
+	if _, err := c.Read(make([]byte, 1)); err != io.EOF {
+		t.Errorf("same router address not limited: %v", err)
+	}
+	// 틀린 PROXY 줄 = 끊김
+	d := dial("PROXY TCP4 nonsense\r\n")
+	defer d.Close()
+	d.SetReadDeadline(time.Now().Add(2 * time.Second))
+	if _, err := d.Read(make([]byte, 1)); err != io.EOF {
+		t.Errorf("bad PROXY line not closed: %v", err)
+	}
+}
+
+// 8210bis-29 5.10 : 구간 안에서 생겼다 없어진 customer 는 delta 에 넣지 않음 (라우터가 받은 적 없는 ASPA 철회 금지)
+func TestASPADeltaNoPhantomWithdraw(t *testing.T) {
+	st := &store{Session: 1}
+	st.update(mkSet(nil, map[uint32][]uint32{65001: {174}}))             // serial 0
+	st.update(mkSet(nil, map[uint32][]uint32{65001: {174}, 65010: {1}})) // 1 : 65010 생김
+	st.update(mkSet(nil, map[uint32][]uint32{65001: {174, 3356}}))       // 2 : 65010 없어짐, 65001 바뀜
+	st.update(mkSet(nil, map[uint32][]uint32{65001: {174}}))             // 3 : 65001 되돌아감
+	chg := func(from, to uint32) []uint32 {
+		_, _, _, _, c, ok := st.netDiffTo(from, to)
+		if !ok {
+			t.Fatalf("%d->%d not ok", from, to)
+		}
+		return c
+	}
+	if c := chg(0, 2); len(c) != 1 || c[0] != 65001 {
+		t.Errorf("0->2 = %v, want [65001]", c)
+	}
+	if c := chg(0, 3); len(c) != 0 {
+		t.Errorf("0->3 = %v, want none", c)
+	}
+	if c := chg(1, 2); len(c) != 2 {
+		t.Errorf("1->2 = %v, want [65001 65010]", c)
+	}
+}
+
+// 8210bis-29 8.5 / 5.8 : 라우터가 보낼 것이 아닌 PDU = Error 3, 그 판에 없는 PDU = Error 5,
+// Error Report 에는 판이 틀려도 답하지 않고 끊음
+func TestRTRInvalidRequest(t *testing.T) {
+	st := &store{Session: 77}
+	st.update(mkSet([]rtrVRP{vr("10.0.0.0/8", 24, 65001)}, nil))
+	srv := &rtrServer{St: st, Refresh: 600, Retry: 300, Expire: 7200, Logf: testLogf(t),
+		Allow: []netip.Prefix{netip.MustParsePrefix("127.0.0.0/8")}}
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	go srv.serve(ln)
+	try := func(ver, typ uint8) (pdu, bool) {
+		c, err := net.Dial("tcp", ln.Addr().String())
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer c.Close()
+		c.Write(query(ver, typ, 0, nil))
+		c.SetReadDeadline(time.Now().Add(5 * time.Second))
+		hdr := make([]byte, 8)
+		if _, err := io.ReadFull(c, hdr); err != nil {
+			return pdu{}, false // 답 없이 끊김
+		}
+		ln := binary.BigEndian.Uint32(hdr[4:])
+		body := make([]byte, ln-8)
+		io.ReadFull(c, body)
+		return pdu{ver: hdr[0], typ: hdr[1], field: binary.BigEndian.Uint16(hdr[2:]), body: body}, true
+	}
+	if p, ok := try(1, pduCacheResp); !ok || p.typ != pduErrorReport || p.field != errInvalidRequest {
+		t.Errorf("v1 Cache Response: %+v %v", p, ok)
+	}
+	if p, ok := try(1, pduASPA); !ok || p.typ != pduErrorReport || p.field != errUnsupportedPDU {
+		t.Errorf("v1 ASPA: %+v %v", p, ok)
+	}
+	if p, ok := try(3, pduErrorReport); ok {
+		t.Errorf("error report v3 got reply %+v", p)
 	}
 }

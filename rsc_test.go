@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 package main
 
 // rsc_test.go : RSC (RFC 9323) 를 직접 만들어 파싱 / 체인 / 파일 확인
@@ -38,11 +40,6 @@ func tlv(tag byte, parts ...[]byte) []byte {
 		l = []byte{0x83, byte(n >> 16), byte(n >> 8), byte(n)}
 	}
 	return append(append([]byte{tag}, l...), body...)
-}
-
-func derOID(o asn1.ObjectIdentifier) []byte {
-	b, _ := asn1.Marshal(o)
-	return b
 }
 
 func derInt(v int64) []byte {
@@ -152,6 +149,7 @@ func makeRSC(t *testing.T, ca *rpkiCert, caKey *rsa.PrivateKey, o rscOpts, entri
 	attrs := [][]byte{
 		tlv(0x30, derOID(oidAttrCType), tlv(0x31, derOID(oidCTRSC))),
 		tlv(0x30, derOID(oidAttrDigest), tlv(0x31, tlv(0x04, md[:]))),
+		tlv(0x30, derOID(oidAttrSignTime), tlv(0x31, tlv(0x17, []byte("261118000000Z")))),
 	}
 	sort.Slice(attrs, func(i, j int) bool { return bytes.Compare(attrs[i], attrs[j]) < 0 })
 	signed := tlv(0x31, attrs...)

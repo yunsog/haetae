@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 package main
 
 // ops.go : 운영 안정 (0.2.0)
@@ -17,9 +19,7 @@ import (
 	"net"
 	"net/http"
 	"os"
-	"os/signal"
 	"strconv"
-	"syscall"
 	"time"
 )
 
@@ -178,9 +178,8 @@ func (d *daemon) watchdog() {
 
 // watchTerm : SIGTERM / SIGINT 이면 정리하고 끝냄
 func (d *daemon) watchTerm() {
-	ch := make(chan os.Signal, 1)
-	signal.Notify(ch, syscall.SIGTERM, syscall.SIGINT)
-	sig := <-ch
+	sig := <-d.termCh // signal.Notify 는 시작 때 (daemon.go)
+	d.termSeen.Store(true)
 	log.Printf("%v: stopping", sig)
 	sdNotify("STOPPING=1")
 	d.mu.Lock()

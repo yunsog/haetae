@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 package main
 
 // rsc.go : RPKI Signed Checklist (RFC 9323, .sig)

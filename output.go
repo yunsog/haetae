@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 package main
 
 // output.go : 검증 결과 파일
@@ -7,7 +9,7 @@ package main
 //   objects.jsonl 전체 객체 목록 (E6) : 객체 하나에 한 줄
 //   rejects.txt   거부된 객체 (URI<TAB>이유)
 //   summary.txt   종류별 개수, 경고 개수
-// 파일은 임시 이름으로 쓰고 rename (읽는 쪽이 반쯤 쓴 파일을 보지 않게)
+// 파일은 임시 이름으로 쓰고 fsync 뒤 rename (읽는 쪽이 반쯤 쓴 파일을 보지 않게, 정전 뒤 빈 파일이 없게)
 
 import (
 	"bufio"
@@ -41,10 +43,44 @@ func writeAtomic(dir, name string, fn func(w *bufio.Writer) error) error {
 		tmp.Close()
 		return err
 	}
+	if err := tmp.Sync(); err != nil { // rename 전에 내용을 디스크에 (정전 뒤 빈 파일 막기, B4)
+		tmp.Close()
+		return err
+	}
 	if err := tmp.Close(); err != nil {
 		return err
 	}
 	return os.Rename(tmp.Name(), filepath.Join(dir, name))
+}
+
+// writeFileSync : os.WriteFile + 디스크에 내려쓰기 (fsync). rename 으로 바꿔 끼울 임시 파일용 (B4).
+// fsync 없이 rename 하면 정전 뒤 "이름은 새 파일, 내용은 빈 파일" 이 될 수 있음 (ext4 지연 할당)
+func writeFileSync(path string, data []byte, perm os.FileMode) error {
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, perm)
+	if err != nil {
+		return err
+	}
+	_, err = f.Write(data)
+	if err == nil {
+		err = f.Sync()
+	}
+	if cerr := f.Close(); err == nil {
+		err = cerr
+	}
+	return err
+}
+
+// syncPath : 파일 / 폴더 하나를 fsync (폴더면 그 안의 이름 목록이 디스크에)
+func syncPath(path string) error {
+	f, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	err = f.Sync()
+	if cerr := f.Close(); err == nil {
+		err = cerr
+	}
+	return err
 }
 
 // sortedVRPs : 주소, prefix 길이, maxLength, ASN, TA 순
@@ -96,6 +132,20 @@ func (v *validator) writeOutputs(dir string, started time.Time) error {
 		return bytes.Compare(v.rkeys[i].SKI, v.rkeys[j].SKI) < 0
 	})
 
+	// CCR (ccr.go) : 파일 + json metadata 의 칸별 해시. 끔이면 옛 rpki.ccr 를 지움 (옛 파일을 최신으로 오해하지 않게)
+	var ccrHash ccrHashes
+	if v.CCR {
+		v.ccrDER, ccrHash = v.buildCCR()
+		if err := writeAtomic(dir, "rpki.ccr", func(w *bufio.Writer) error {
+			_, err := w.Write(v.ccrDER)
+			return err
+		}); err != nil {
+			return err
+		}
+	} else {
+		os.Remove(filepath.Join(dir, "rpki.ccr"))
+	}
+
 	err := writeAtomic(dir, "csv", func(w *bufio.Writer) error {
 		w.WriteString("ASN,IP Prefix,Max Length,Trust Anchor,Expires\n")
 		for _, k := range vrps {
@@ -118,6 +168,10 @@ func (v *validator) writeOutputs(dir string, started time.Time) error {
 			"failed_tals": v.failedTA,
 			"counts":      v.count,
 		}
+		if v.CCR { // rpki-client 9.9 와 같은 이름 (CCR 칸의 SHA-256, base64)
+			meta["ccr_mfts_hash"], meta["ccr_vrps_hash"], meta["ccr_vaps_hash"] = ccrHash.Mfts, ccrHash.VRPs, ccrHash.VAPs
+			meta["ccr_tas_hash"], meta["ccr_brks_hash"] = ccrHash.TAs, ccrHash.RKs
+		}
 		mb, _ := json.MarshalIndent(meta, "\t", "\t")
 		fmt.Fprintf(w, "{\n\t\"metadata\": %s,\n\t\"roas\": [\n", mb)
 		for i, k := range vrps {
@@ -131,12 +185,7 @@ func (v *validator) writeOutputs(dir string, started time.Time) error {
 		w.WriteString("\t],\n\t\"aspas\": [\n")
 		for i, k := range akeys {
 			a := v.aspas[k]
-			ps := make([]uint32, 0, len(a.Providers))
-			for p := range a.Providers {
-				ps = append(ps, p)
-			}
-			sort.Slice(ps, func(i, j int) bool { return ps[i] < ps[j] })
-			pb, _ := json.Marshal(ps)
+			pb, _ := json.Marshal(mergedProviders(a.Providers))
 			sep := ","
 			if i == len(akeys)-1 {
 				sep = ""

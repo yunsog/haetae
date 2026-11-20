@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 package main
 
 // tak_test.go : TAK (RFC 9691) 경고. 저장소에 실제 TAK 가 없어 확인을 통과한 TAK 모양만 만들어 checkTAK 를 봄

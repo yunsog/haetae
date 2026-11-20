@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 package main
 
 // aspa_verify.go : ASPA 경로 검증 (draft-ietf-sidrops-aspa-verification-29, 2026-10, 5.3 ~ 5.6 절)

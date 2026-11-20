@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 package main
 
 // der_test.go : 잘못된 DER 을 거부하는지 (go test)

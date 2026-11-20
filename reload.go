@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 package main
 
 // reload.go : systemctl reload haetae (= SIGHUP) 때 설정을 다시 읽음 (재시작 아님, RTR 세션 / VRP / 회차 그대로)
@@ -39,6 +41,10 @@ var confFields = []confField{
 	{"paths.state", true, func(c *daemonConfig) string { return c.StateDir }},
 	{"paths.tal", false, func(c *daemonConfig) string { return c.TALDir }},
 	{"paths.slurm", false, func(c *daemonConfig) string { return c.SLURM }},
+	{"paths.constraints", false, func(c *daemonConfig) string { return c.Constraints }},
+	{"ccr.mode", false, func(c *daemonConfig) string { return c.CCRMode }},
+	{"ccr.keep", false, func(c *daemonConfig) string { return str(c.CCRKeep) }},
+	{"ccr.dir", false, func(c *daemonConfig) string { return c.CCRDir }},
 	{"fetch.interval", false, func(c *daemonConfig) string { return str(c.Interval) }},
 	{"fetch.jobs", false, func(c *daemonConfig) string { return str(c.FetchJobs) }},
 	{"fetch.deadline", false, func(c *daemonConfig) string { return str(c.FetchDeadline) }},
@@ -94,7 +100,7 @@ func parsePrefixes(list []string) ([]netip.Prefix, error) {
 func tlsLive(cur *atomic.Pointer[tls.Config], first *tls.Config) *tls.Config {
 	cur.Store(first)
 	return &tls.Config{
-		MinVersion: tls.VersionTLS12,
+		MinVersion: tls.VersionTLS13, // RFC 9852 (8210bis-29 9 장의 BCP 195)
 		GetConfigForClient: func(*tls.ClientHelloInfo) (*tls.Config, error) {
 			return cur.Load(), nil
 		},

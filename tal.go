@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 package main
 
 // tal.go : TAL (Trust Anchor Locator, RFC 8630)
@@ -27,6 +29,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"time"
 )
 
 // builtinTALs : 빌드할 때 tals/*.tal 이 실행 파일 안에 들어감 (바꾸려면 tals/ 고치고 다시 빌드)
@@ -133,6 +136,26 @@ func (t *tal) checkTA(der []byte) (*rpkiCert, error) {
 		return nil, fmt.Errorf("inherit not allowed")
 	}
 	return c, nil
+}
+
+// preferNewTA : 새로 받은 TA 와 캐시의 TA 가운데 새 것을 쓸지 (RFC 10097 2 장, false = 캐시 그대로)
+// 둘 다 checkTA 를 통과하고 지금 유효한 것. notBefore 가 늦은 쪽 -> 같으면 유효 기간이 짧은 쪽 -> 그것도 같으면 새 것
+// 중간에서 옛 TA 인증서 (키는 같음) 를 다시 보여 주어도 캐시의 더 새 TA 를 버리지 않게 함
+func preferNewTA(nw, old *x509.Certificate) bool {
+	if !nw.NotBefore.Equal(old.NotBefore) {
+		return nw.NotBefore.After(old.NotBefore)
+	}
+	dn := nw.NotAfter.Sub(nw.NotBefore)
+	do := old.NotAfter.Sub(old.NotBefore)
+	if dn != do {
+		return dn < do
+	}
+	return true
+}
+
+// certCurrent : now 가 인증서 유효 기간 안인지
+func certCurrent(c *x509.Certificate, now time.Time) bool {
+	return !now.Before(c.NotBefore) && !now.After(c.NotAfter)
 }
 
 // loadTALs : dir 이 비었으면 내장 TAL, 아니면 그 폴더의 *.tal. 하나라도 깨지면 오류 (반쪽 TA 로 돌지 않음)

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 package main
 
 // history.go : 회차 이력 (/api/v1/history, 30 일) 과 Prometheus /metrics
@@ -157,6 +159,7 @@ func (d *daemon) handleMetrics(w http.ResponseWriter, r *http.Request) {
 	d.st.mu.RUnlock()
 	d.mu.Lock()
 	last, lastOK, runs, rtrOpen, view, started, handovers := d.last, d.lastOK, d.runs, d.rtrOpen, d.view, d.started, d.ho.Count
+	repos := d.repos // 회차마다 새 조각으로 바꿈 (고쳐 쓰지 않음) -> 잠금을 푼 뒤 읽어도 됨
 	notApplied := maps.Clone(d.notApplied)
 	d.mu.Unlock()
 
@@ -218,9 +221,55 @@ func (d *daemon) handleMetrics(w http.ResponseWriter, r *http.Request) {
 		metric(bw, "haetae_unsafe_vrps", "VRPs overlapping resources of rejected CAs", "gauge", nil, float64(len(view.Unsafe)))
 	}
 	if d.rtr != nil {
-		metric(bw, "haetae_rtr_clients", "connected RTR clients", "gauge", nil, float64(len(d.rtr.clientsInfo())))
+		clients := d.rtr.clientsInfo()
+		metric(bw, "haetae_rtr_clients", "connected RTR clients", "gauge", nil, float64(len(clients)))
+		// 판별 연결 수 (0.4.0) : 0 / 1 / 2 는 언제나 씀 (그래프 줄이 끊기지 않게), none = 아직 질의 없음
+		byVer := map[string]int{"0": 0, "1": 0, "2": 0}
+		for _, c := range clients {
+			if c.Version < 0 {
+				byVer["none"]++
+			} else {
+				byVer[strconv.Itoa(c.Version)]++
+			}
+		}
+		head(bw, "haetae_rtr_clients_by_version", "connected RTR clients by protocol version", "gauge")
+		for _, k := range sortedKeys(byVer) {
+			sample(bw, "haetae_rtr_clients_by_version", map[string]string{"version": k}, float64(byVer[k]))
+		}
+		head(bw, "haetae_rtr_queries_total", "RTR queries from routers, by type", "counter")
+		sample(bw, "haetae_rtr_queries_total", map[string]string{"type": "reset"}, float64(d.rtr.nReset.Load()))
+		sample(bw, "haetae_rtr_queries_total", map[string]string{"type": "serial"}, float64(d.rtr.nSerial.Load()))
+		metric(bw, "haetae_rtr_refused_total", "RTR connections refused by connection limits", "counter", nil, float64(d.rtr.nRefused.Load()))
 	}
+	head(bw, "haetae_http_requests_total", "HTTP requests by access level", "counter")
+	for i, a := range []string{"internal", "public", "forbidden"} {
+		sample(bw, "haetae_http_requests_total", map[string]string{"access": a}, float64(httpRequests[i].Load()))
+	}
+	writeRepoMetrics(bw, repos)
 	metric(bw, "haetae_memory_rss_bytes", "resident memory", "gauge", nil, float64(memRSS()))
+}
+
+// writeRepoMetrics : 저장소별 (0.4.0, 지금 약 125 개). up = 이번 회차 결과 ok (1/0), 연속 실패, 마지막 성공 시각.
+// 실패 / backoff 로 건너뛴 저장소를 Grafana 표 / 알림으로 바로 봄
+func writeRepoMetrics(w io.Writer, repos []repoStatus) {
+	if len(repos) == 0 {
+		return
+	}
+	lb := func(r repoStatus) map[string]string { return map[string]string{"type": r.Type, "uri": r.URI} }
+	head(w, "haetae_repository_up", "repository fetched fresh in last run (1/0)", "gauge")
+	for _, r := range repos {
+		sample(w, "haetae_repository_up", lb(r), b2f(r.Result == "ok"))
+	}
+	head(w, "haetae_repository_consecutive_failures", "consecutive failed runs of a repository", "gauge")
+	for _, r := range repos {
+		sample(w, "haetae_repository_consecutive_failures", lb(r), float64(r.Failures))
+	}
+	head(w, "haetae_repository_last_success_timestamp_seconds", "last successful fetch since process start (epoch)", "gauge")
+	for _, r := range repos {
+		if r.LastSuccess != nil {
+			sample(w, "haetae_repository_last_success_timestamp_seconds", lb(r), float64(r.LastSuccess.Unix()))
+		}
+	}
 }
 
 func b2f(b bool) float64 {

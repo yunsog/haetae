@@ -1,0 +1,16 @@
+# Prometheus scrape example for Haetae (add the job to scrape_configs in your prometheus.yml)
+#
+# /metrics is served on internal access only : put the Prometheus server address in [http] allow
+# of /etc/haetae/haetae.conf (then systemctl reload haetae). Public addresses get 403.
+# Haetae validates every 10 minutes; a 1 minute scrape still shows RTR / HTTP counters smoothly.
+
+scrape_configs:
+  - job_name: haetae
+    scrape_interval: 1m
+    scrape_timeout: 10s
+    static_configs:
+      - targets: ["haetae.example.net:5002"]   # [http] listen of Haetae
+        labels:
+          instance: haetae1                    # shown in the dashboard instance list
+
+# Alert rules (optional) : rule_files: ["haetae_alerts.yml"]

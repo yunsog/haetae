@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 package main
 
 // config.go : 설정 파일 (기본 /etc/haetae/haetae.conf, 상주 모드만)
@@ -28,11 +30,16 @@ const defConfig = "/etc/haetae/haetae.conf"
 
 // confKeys : 설정 파일 "구역.키" -> 옵션 이름. "!" 로 시작하면 bool 을 뒤집어 넣음 (rsync = true -> -norsync=false)
 var confKeys = map[string]string{
-	"paths.cache": "cache",
-	"paths.out":   "o",
-	"paths.state": "state",
-	"paths.tal":   "tal",
-	"paths.slurm": "slurm",
+	"paths.cache":       "cache",
+	"paths.out":         "o",
+	"paths.state":       "state",
+	"paths.tal":         "tal",
+	"paths.slurm":       "slurm",
+	"paths.constraints": "constraints",
+
+	"ccr.mode": "ccr",
+	"ccr.keep": "ccr-keep",
+	"ccr.dir":  "ccr-dir",
 
 	"fetch.interval": "interval",
 	"fetch.jobs":     "fetch-j",

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 package main
 
 // repo_test.go : RRDP 와 rsync 가 모두 실패하면 예전에 받은 RRDP 데이터를 씀 (A2), TA 는 확인한 뒤에만 캐시에

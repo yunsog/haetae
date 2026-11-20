@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 package main
 
 // slurm.go : SLURM (RFC 8416) 로컬 예외 (결정 D2)
@@ -5,7 +7,8 @@ package main
 // 운용자가 검증 결과를 직접 고치는 JSON 파일
 //   validationOutputFilters : 빼기  (prefixFilters / bgpsecFilters / aspaFilters)
 //   locallyAddedAssertions  : 더하기 (prefixAssertions / bgpsecAssertions / aspaAssertions)
-// aspa* 는 draft-ietf-sidrops-aspa-slurm (없어도 됨).
+// slurmVersion 1 = RFC 8416 (aspa* 없음), 2 = draft-ietf-sidrops-aspa-slurm-04 (aspaFilters / aspaAssertions 둘 다 있어야 함,
+// 비어 있어도 됨). 11-18 전에는 1 에 aspa* 를 적고 키 이름도 달랐음 (customer_asid / provider_set) -> -04 대로 바꿈
 // 파일이 없으면 (nil) 아무것도 안 함.
 
 import (
@@ -35,8 +38,8 @@ type slurmBGPsecFilter struct {
 }
 
 type slurmASPAFilter struct {
-	Customer uint32 `json:"customer_asid"`
-	Comment  string `json:"comment,omitempty"`
+	Customer *uint32 `json:"customerAsn"` // 필수 (없으면 0 이 되지 않게 포인터)
+	Comment  string  `json:"comment,omitempty"`
 }
 
 type slurmPrefixAssertion struct {
@@ -54,8 +57,8 @@ type slurmBGPsecAssertion struct {
 }
 
 type slurmASPAAssertion struct {
-	Customer  uint32   `json:"customer_asid"`
-	Providers []uint32 `json:"provider_set"`
+	Customer  *uint32  `json:"customerAsn"`  // 필수
+	Providers []uint32 `json:"providerAsns"` // 필수, 오름차순, 중복 없음, customer 제외 (-04 3.2 장)
 	Comment   string   `json:"comment,omitempty"`
 }
 
@@ -64,12 +67,12 @@ type slurmFile struct {
 	Filters struct {
 		Prefix []slurmPrefixFilter `json:"prefixFilters"`
 		BGPsec []slurmBGPsecFilter `json:"bgpsecFilters"`
-		ASPA   []slurmASPAFilter   `json:"aspaFilters,omitempty"`
+		ASPA   []slurmASPAFilter   `json:"aspaFilters"` // nil = 키 없음, [] = 빈 목록
 	} `json:"validationOutputFilters"`
 	Asserts struct {
 		Prefix []slurmPrefixAssertion `json:"prefixAssertions"`
 		BGPsec []slurmBGPsecAssertion `json:"bgpsecAssertions"`
-		ASPA   []slurmASPAAssertion   `json:"aspaAssertions,omitempty"`
+		ASPA   []slurmASPAAssertion   `json:"aspaAssertions"`
 	} `json:"locallyAddedAssertions"`
 }
 
@@ -90,8 +93,8 @@ func loadSLURM(path string) (*slurmFile, error) {
 	if err := json.Unmarshal(b, &s); err != nil {
 		return nil, fmt.Errorf("SLURM JSON: %w", err)
 	}
-	if s.Version != 1 {
-		return nil, fmt.Errorf("SLURM version %d", s.Version)
+	if err := s.checkASPA(); err != nil {
+		return nil, err
 	}
 	for i := range s.Filters.Prefix {
 		f := &s.Filters.Prefix[i]
@@ -135,6 +138,43 @@ func loadSLURM(path string) (*slurmFile, error) {
 	return &s, nil
 }
 
+// checkASPA : 판에 따른 aspa* 키 (1 = 없어야, 2 = 있어야) 와 -04 3 장 규칙
+func (s *slurmFile) checkASPA() error {
+	hasF, hasA := s.Filters.ASPA != nil, s.Asserts.ASPA != nil
+	switch s.Version {
+	case 1:
+		if hasF || hasA {
+			return fmt.Errorf("SLURM version 1 with aspaFilters / aspaAssertions (use slurmVersion 2)")
+		}
+		return nil
+	case 2:
+		if !hasF || !hasA {
+			return fmt.Errorf("SLURM version 2 needs aspaFilters and aspaAssertions")
+		}
+	default:
+		return fmt.Errorf("SLURM version %d", s.Version)
+	}
+	for _, f := range s.Filters.ASPA {
+		if f.Customer == nil {
+			return fmt.Errorf("aspaFilter without customerAsn")
+		}
+	}
+	for _, a := range s.Asserts.ASPA {
+		if a.Customer == nil || len(a.Providers) == 0 {
+			return fmt.Errorf("aspaAssertion without customerAsn / providerAsns")
+		}
+		for i, p := range a.Providers {
+			if p == *a.Customer {
+				return fmt.Errorf("aspaAssertion AS%d: customer in providerAsns", p)
+			}
+			if i > 0 && p <= a.Providers[i-1] {
+				return fmt.Errorf("aspaAssertion AS%d: providerAsns not ascending / duplicate", *a.Customer)
+			}
+		}
+	}
+	return nil
+}
+
 // filterVRP : true = 이 VRP 를 뺌. 필터의 prefix 는 VRP prefix 를 포함하면 (같거나 더 넓으면) 해당
 func (s *slurmFile) filterVRP(asn uint32, p netip.Prefix) bool {
 	if s == nil {
@@ -173,7 +213,7 @@ func (s *slurmFile) filterASPA(customer uint32) bool {
 		return false
 	}
 	for _, f := range s.Filters.ASPA {
-		if f.Customer == customer {
+		if *f.Customer == customer {
 			return true
 		}
 	}
@@ -207,15 +247,14 @@ func (s *slurmFile) addAssertions(p *payloadSet) {
 		p.Keys[k] = true
 	}
 	for _, a := range s.Asserts.ASPA {
+		c := *a.Customer
 		m := map[uint32]bool{}
-		for _, x := range p.ASPAs[a.Customer] {
+		for _, x := range p.ASPAs[c] {
 			m[x] = true
 		}
-		for _, x := range a.Providers {
-			if x != a.Customer {
-				m[x] = true
-			}
+		for _, x := range a.Providers { // customer 는 loadSLURM 에서 이미 거부
+			m[x] = true
 		}
-		p.ASPAs[a.Customer] = sortedASNs(m)
+		p.ASPAs[c] = mergedProviders(m)
 	}
 }

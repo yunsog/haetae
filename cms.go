@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 package main
 
 // cms.go : RPKI 서명 객체 (RFC 6488 CMS SignedData) 껍데기
@@ -28,7 +30,6 @@ var (
 	oidAttrCType    = asn1.ObjectIdentifier{1, 2, 840, 113549, 1, 9, 3}
 	oidAttrDigest   = asn1.ObjectIdentifier{1, 2, 840, 113549, 1, 9, 4}
 	oidAttrSignTime = asn1.ObjectIdentifier{1, 2, 840, 113549, 1, 9, 5}
-	oidAttrBinTime  = asn1.ObjectIdentifier{1, 2, 840, 113549, 1, 9, 16, 2, 46}
 
 	// eContentType
 	oidCTROA      = asn1.ObjectIdentifier{1, 2, 840, 113549, 1, 9, 16, 1, 24}
@@ -40,7 +41,7 @@ type signedObject struct {
 	EE          *rpkiCert
 	ContentType asn1.ObjectIdentifier
 	Content     []byte    // eContent (ROA / manifest 본문 DER)
-	SigningTime time.Time // 있으면 (참고용)
+	SigningTime time.Time // 서명 시각 (참고용, 값은 검증에 안 씀)
 }
 
 // parseSignedObject : 파일 바이트 -> 서명 확인까지 한 signedObject
@@ -227,10 +228,10 @@ func (so *signedObject) checkSignerInfo(n derNode) error {
 	return nil
 }
 
-// parseSignedAttrs : contentType (필수) + messageDigest (필수) + signingTime / binarySigningTime (선택)
-// 그 외 속성, 중복, 값 여러 개는 거부. messageDigest 값을 돌려줌
+// parseSignedAttrs : contentType + messageDigest + signingTime 셋 다 필수 (RFC 9589 4 장, 11-18 전에는 signingTime 선택)
+// binarySigningTime (RFC 9589 이 금지), 그 외 속성, 중복, 값 여러 개는 거부. messageDigest 값을 돌려줌
 func (so *signedObject) parseSignedAttrs(n derNode) ([]byte, error) {
-	attrs, err := derChildren(n, 4) // 속성 종류가 4 개뿐 (중복은 아래에서 거부)
+	attrs, err := derChildren(n, 3) // 속성 종류가 3 개뿐 (중복은 아래에서 거부)
 	if err != nil {
 		return nil, err
 	}
@@ -274,16 +275,15 @@ func (so *signedObject) parseSignedAttrs(n derNode) ([]byte, error) {
 				return nil, fmt.Errorf("bad signingTime")
 			}
 			so.SigningTime = t
-		case oid.Equal(oidAttrBinTime):
-			if _, err := derUint(v, 1<<62); err != nil {
-				return nil, fmt.Errorf("bad binarySigningTime")
-			}
 		default:
 			return nil, fmt.Errorf("unexpected signedAttr %s", oid)
 		}
 	}
 	if !seen[oidAttrCType.String()] || digest == nil {
 		return nil, fmt.Errorf("signedAttrs without contentType / messageDigest")
+	}
+	if !seen[oidAttrSignTime.String()] {
+		return nil, fmt.Errorf("signedAttrs without signingTime (RFC 9589)")
 	}
 	return digest, nil
 }

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 package main
 
 // rfc3779.go : RFC 3779 IP / AS 자원 확장
@@ -44,9 +46,10 @@ type asRange struct {
 
 // asResources : AS 번호 자원 (rdi 는 RPKI 에서 금지)
 type asResources struct {
-	Present bool
-	Inherit bool
-	Ranges  []asRange
+	Present  bool
+	Inherit  bool
+	Ranges   []asRange
+	HasRange bool // range 모양으로 적은 항목이 있음 (ASPA EE 는 id 하나만, aspa-profile 4 장)
 }
 
 // afiLen : 주소 체계의 바이트 수
@@ -247,6 +250,7 @@ func parseASIdentifiers(der []byte) (asResources, error) {
 				return res, fmt.Errorf("AS range min > max")
 			}
 			r.Min, r.Max = uint32(lo), uint32(hi)
+			res.HasRange = true
 		}
 		res.Ranges = append(res.Ranges, r)
 	}

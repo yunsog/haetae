@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 package main
 
 // vrp.go : 라우터 / API 에 주는 데이터 집합과 serial, 변경분 (delta)
@@ -15,6 +17,7 @@ import (
 	"fmt"
 	"net/netip"
 	"os"
+	"slices"
 	"sort"
 	"sync"
 	"time"
@@ -214,11 +217,27 @@ func newPayloadSet(v *validator, slurm *slurmFile) *payloadSet {
 		}
 	}
 	for c, ps := range merged {
-		p.ASPAs[c] = sortedASNs(ps)
+		// 고객 AS 마다 합친 provider 가 상한을 넘으면 일부만 내지 않고 그 고객 AS 전체를 뺌 (aspa-profile-31 5 장)
+		if len(ps) > maxASPAProviders {
+			v.warn("ASPA providers per customer over limit, customer dropped", fmt.Sprintf("AS%d: %d providers", c, len(ps)))
+			continue
+		}
+		p.ASPAs[c] = mergedProviders(ps)
 	}
 	slurm.addAssertions(p)
 	sort.Slice(p.Full, func(i, j int) bool { return lessVRPKey(p.Full[i], p.Full[j]) })
 	return p
+}
+
+// mergedProviders : 같은 customer 의 ASPA 들을 합친 provider 목록 (U-SPAS, 오름차순).
+// AS 0 ("provider 없음") 은 다른 AS 와 함께면 뺌 = 모든 ASPA 가 AS 0 만일 때만 남음
+// (aspa-profile-31 5.2, aspa-verification-29, 8210bis-29 : 라우터는 AS 0 이 섞인 ASPA PDU 를 Error Code 9 로 거부. 11-17)
+func mergedProviders(m map[uint32]bool) []uint32 {
+	out := sortedASNs(m)
+	if len(out) > 1 && out[0] == 0 {
+		out = out[1:]
+	}
+	return out
 }
 
 func sortedASNs(m map[uint32]bool) []uint32 {
@@ -428,8 +447,11 @@ func (s *store) netDiffTo(from, to uint32) (ann, wdr []rtrVRP, kAnn, kWdr []rtrK
 			kWdr = append(kWdr, k)
 		}
 	}
+	// 구간 안에서 바뀌었다 돌아온 customer (생겼다 없어짐 등) 는 뺌 : 라우터가 받은 적 없는 ASPA 를 철회하면 안 됨 (8210bis-29 5.10)
 	for c := range as {
-		aspaChg = append(aspaChg, c)
+		if !slices.Equal(s.aspaAt(c, from), s.aspaAt(c, to)) {
+			aspaChg = append(aspaChg, c)
+		}
 	}
 	// 순서를 고정 (map 순서는 매번 다름 -> 같은 delta 가 매번 다른 순서였음, 11-04). RTR / json-delta / vrps/delta 모두 여기를 지남
 	sortRTRVRPs(ann)
@@ -440,11 +462,17 @@ func (s *store) netDiffTo(from, to uint32) (ann, wdr []rtrVRP, kAnn, kWdr []rtrK
 	return ann, wdr, kAnn, kWdr, aspaChg, true
 }
 
+// serialLE : RTR serial 비교 a <= b (RFC 1982, 32 비트). serial 은 끝 (2^32-1) 다음에 0 으로 돌아가므로
+// 크기로 비교하지 않고 차이로 비교 : b 가 a 보다 2^31 미만 앞서면 a <= b (10 분 회차로 한 바퀴는 약 8 만 년, B7 정리)
+func serialLE(a, b uint32) bool {
+	return a == b || int32(b-a) > 0
+}
+
 // aspaAt : serial to 시점의 customer c 의 provider 목록 (nil = 없음). RLock 필요
 // to 뒤에 c 를 처음 바꾼 delta 의 "바뀌기 전" 값, 그런 delta 가 없으면 지금 값
 func (s *store) aspaAt(c, to uint32) []uint32 {
 	for _, d := range s.History {
-		if d.Serial <= to {
+		if serialLE(d.Serial, to) {
 			continue
 		}
 		if old, ok := d.OldASPAOf[c]; ok {
@@ -566,7 +594,7 @@ func saveRTRState(path string, s *store) error {
 	s.mu.RUnlock()
 	b, _ := json.MarshalIndent(st, "", " ")
 	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, b, 0644); err != nil {
+	if err := writeFileSync(tmp, b, 0644); err != nil {
 		return err
 	}
 	return os.Rename(tmp, path)

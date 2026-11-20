@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 package main
 
 // cert_test.go : SKI = SHA-1(공개 키) 검사 (RFC 6487 4.8.2, 지금은 경고만)

@@ -1,0 +1,42 @@
+# Prometheus alert rule examples for Haetae (rule_files in prometheus.yml).
+# Thresholds assume the defaults : run every 10 minutes, RTR expire 7200 s.
+
+groups:
+  - name: haetae
+    rules:
+      - alert: HaetaeDown
+        expr: up{job="haetae"} == 0
+        for: 5m
+        annotations:
+          summary: "Haetae /metrics not reachable ({{ $labels.instance }})"
+
+      - alert: HaetaeDataOld
+        # served set older than 1 hour : runs fail or are not applied (TA failed, VRP drop held ...)
+        expr: haetae_data_age_seconds > 3600
+        for: 10m
+        annotations:
+          summary: "Haetae data is {{ $value | humanizeDuration }} old"
+
+      - alert: HaetaeRTRClosed
+        expr: haetae_rtr_open == 0
+        for: 10m
+        annotations:
+          summary: "Haetae RTR listener is not open"
+
+      - alert: HaetaeRunsNotApplied
+        expr: increase(haetae_runs_not_applied_total[1h]) > 2
+        annotations:
+          summary: "Haetae did not apply runs ({{ $labels.reason }})"
+
+      - alert: HaetaeRepositoryFailing
+        # newly failing : 6 runs in a row (about 1 hour) now, but not 1 day ago.
+        # Long-dead repositories (some fail for weeks) stay out; see them in the dashboard table
+        expr: haetae_repository_consecutive_failures >= 6 unless (haetae_repository_consecutive_failures offset 1d) >= 6
+        annotations:
+          summary: "{{ $labels.uri }} failed {{ $value }} runs in a row"
+
+      - alert: HaetaeVRPDrop
+        # more than 10 % fewer VRPs than 1 hour ago
+        expr: haetae_vrps < 0.9 * (haetae_vrps offset 1h)
+        annotations:
+          summary: "Haetae VRPs dropped to {{ $value }}"

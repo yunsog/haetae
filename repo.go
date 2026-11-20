@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 package main
 
 // repo.go : 저장소 수집 관리
@@ -525,13 +527,25 @@ func (f *fetcher) fetchTA(t *tal) error {
 			data, err = f.rsyncFile(ctx, u)
 		}
 		cancel()
+		var c *rpkiCert
 		if err == nil {
 			// 캐시에 넣기 전에 TAL 키와 맞는지 확인 : 서버가 엉뚱한 파일을 주어도 캐시의 정상 TA 를 지우지 않음
-			if _, cerr := t.checkTA(data); cerr != nil {
-				err = fmt.Errorf("not the TA of this TAL: %w", cerr)
+			if c, err = t.checkTA(data); err != nil {
+				err = fmt.Errorf("not the TA of this TAL: %w", err)
+			} else if !certCurrent(c.X509, time.Now()) {
+				// 유효 기간 밖이면 캐시 그대로 (RFC 10097 2 장 2 번)
+				err = fmt.Errorf("TA certificate not current (%s ~ %s)",
+					c.X509.NotBefore.UTC().Format(time.RFC3339), c.X509.NotAfter.UTC().Format(time.RFC3339))
 			}
 		}
 		if err == nil {
+			// 캐시의 TA 가 더 새 것이면 그대로 (RFC 10097 2 장 4 ~ 6 번). 캐시가 없거나 깨졌거나 만료면 새 것
+			old, oerr := t.loadTA(f.CacheDir)
+			if oerr == nil && certCurrent(old.X509, time.Now()) && !preferNewTA(c.X509, old.X509) {
+				f.logf("TA %s: %s is older than cached TA (notBefore %s), keeping cached copy (RFC 10097)",
+					t.Name, u, c.X509.NotBefore.UTC().Format(time.RFC3339))
+				return nil
+			}
 			for _, other := range t.URIs {
 				os.Remove(filepath.Join(dir, filepath.Base(other)))
 			}

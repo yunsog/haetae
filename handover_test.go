@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 package main
 
 // handover_test.go : 무중단 판 올리기 (handover.go)
@@ -24,7 +26,7 @@ import (
 
 func TestRTRPauseResume(t *testing.T) {
 	d := testDaemon(t)
-	s := &rtrServer{St: d.st, Allow: []netip.Prefix{netip.MustParsePrefix("127.0.0.0/8")}, Refresh: 600, Retry: 300, Expire: 7200, Logf: t.Logf}
+	s := &rtrServer{St: d.st, Allow: []netip.Prefix{netip.MustParsePrefix("127.0.0.0/8")}, Refresh: 600, Retry: 300, Expire: 7200, Logf: testLogf(t)}
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
@@ -235,4 +237,71 @@ func waitFor(t *testing.T, limit time.Duration, ok func() bool) {
 
 func beUint32(b []byte) uint32 {
 	return uint32(b[0])<<24 | uint32(b[1])<<16 | uint32(b[2])<<8 | uint32(b[3])
+}
+
+// B5 : 판 올리기 도중 (특히 exec 직전) 의 SIGTERM 을 놓치지 않음. 고치기 전에는 exec 직전에 보내면 3 번 중 1 번꼴로
+// 새 판이 종료 요청을 모른 채 계속 돎 (11-12 재현). 시점 셋 : "exec" 줄을 보자마자, 시작 직후, 시작 + 몇 ms
+func TestHandoverTerm(t *testing.T) {
+	if testing.Short() {
+		t.Skip("builds and runs the binary")
+	}
+	dir := t.TempDir()
+	bin := filepath.Join(dir, "haetae")
+	if out, err := exec.Command("go", "build", "-o", bin, ".").CombinedOutput(); err != nil {
+		t.Fatalf("build: %v\n%s", err, out)
+	}
+	state := filepath.Join(dir, "state")
+	os.MkdirAll(state, 0755)
+	d := testDaemon(t)
+	d.st.Cur.Built = time.Now()
+	saveState(filepath.Join(state, "payload.gob"), d.st)
+	talDir := filepath.Join(dir, "tals")
+	os.MkdirAll(talDir, 0755)
+	ripe, _ := os.ReadFile("tals/ripe.tal")
+	key := string(ripe[strings.Index(string(ripe), "\n\n")+2:])
+	os.WriteFile(filepath.Join(talDir, "test.tal"), []byte("https://127.0.0.1:1/ta.cer\n\n"+key), 0644)
+	conf := filepath.Join(dir, "haetae.conf")
+	os.WriteFile(conf, nil, 0644)
+	for try := 0; try < 6; try++ {
+		logPath := filepath.Join(dir, "log")
+		logf, _ := os.Create(logPath)
+		cmd := exec.Command(bin, "-c", conf, "-cache", filepath.Join(dir, "cache"), "-o", filepath.Join(dir, "out"), "-state", state,
+			"-tal", talDir, "-norsync", "-interval", "1h", "-rtr", freeAddr(t), "-rtr-allow", "127.0.0.1", "-http", freeAddr(t), "-http-allow", "127.0.0.1")
+		cmd.Stdout, cmd.Stderr = logf, logf
+		cmd.Start()
+		waitFor(t, 10*time.Second, func() bool {
+			b, _ := os.ReadFile(logPath)
+			return strings.Contains(string(b), "rtr listen") || strings.Contains(string(b), "listening")
+		})
+		time.Sleep(2 * time.Second)
+		cmd.Process.Signal(syscall.SIGUSR2)
+		deadline := time.Now().Add(20 * time.Second)
+		for time.Now().Before(deadline) {
+			b, _ := os.ReadFile(logPath)
+			if try%3 == 0 && strings.Contains(string(b), ": exec ") {
+				break
+			}
+			if try%3 == 1 && strings.Contains(string(b), "handover: start") {
+				break
+			}
+			if try%3 == 2 && strings.Contains(string(b), "handover: start") {
+				time.Sleep(time.Duration(try) * 5 * time.Millisecond)
+				break
+			}
+			time.Sleep(200 * time.Microsecond)
+		}
+		cmd.Process.Signal(syscall.SIGTERM)
+		done := make(chan error, 1)
+		go func() { done <- cmd.Wait() }()
+		select {
+		case err := <-done:
+			t.Logf("try %d: exited (%v)", try, err)
+		case <-time.After(15 * time.Second):
+			b, _ := os.ReadFile(logPath)
+			t.Errorf("try %d: still running 15 s after SIGTERM\n%s", try, b[max(0, len(b)-1500):])
+			cmd.Process.Kill()
+			<-done
+		}
+		logf.Close()
+	}
 }

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 package main
 
 // valid_test.go : 직전 정상 publication point 저장 / 번호 / 정리 (끝에서 끝까지는 실제 스냅샷으로 확인 : 저장소 파일 0 개여도 VRP 차이 0)
@@ -47,6 +49,14 @@ func TestStoreValid(t *testing.T) {
 	os.Rename(src+".new", src)
 	if b, _ := os.ReadFile(filepath.Join(dir, "a.roa")); string(b) != "roa v1" {
 		t.Errorf("stored changed: %q", b)
+	}
+	// 같은 manifest 라도 파일이 비었으면 (fsync 전 판의 정전) 다시 저장 (B4)
+	os.WriteFile(filepath.Join(dir, "b.crl"), nil, 0644)
+	if err := storeValid(dir, "ca.mft", pp); err != nil {
+		t.Fatal(err)
+	}
+	if b, _ := os.ReadFile(filepath.Join(dir, "b.crl")); string(b) != "crl" {
+		t.Errorf("empty file not rewritten: %q", b)
 	}
 	// 새 manifest -> 바꿔 끼움 (옛 파일 없어짐)
 	pp2 := &pubPoint{mft: &rpkiManifest{Number: big.NewInt(6)}, mftDER: []byte("mft 6"),
@@ -127,5 +137,59 @@ func TestWithValidNumberBack(t *testing.T) {
 	}
 	if n := storedNumber(dir); n == nil || n.Int64() != 3 {
 		t.Errorf("stored %v", n)
+	}
+}
+
+// thisUpdate 역행 (RFC 9286 4.2.1, RFC 9981 2 장의 전제) : 번호가 커도 thisUpdate 가 앞서면 저장본
+func TestWithValidThisUpdateBack(t *testing.T) {
+	vd := t.TempDir()
+	v := newValidator("", time.Now(), 1)
+	dir := validPPDir(vd, validCert("k", "", "rsync://h/repo/ca.mft"))
+	base := time.Date(2026, 11, 19, 0, 0, 0, 0, time.UTC)
+	mk := func(n int64, tu time.Time) *pubPoint {
+		return &pubPoint{mft: &rpkiManifest{Number: big.NewInt(n), ThisUpdate: tu}, mftDER: []byte(big.NewInt(n).String()), paths: map[string]string{}}
+	}
+	okOld := func() (*pubPoint, error) { return mk(9, base), nil }
+
+	if _, _, err := v.withValid(dir, "rsync://h/repo/ca.mft", mk(9, base), nil, okOld); err != nil {
+		t.Fatal(err)
+	}
+	if got := storedThisUpdate(dir); !got.Equal(base) {
+		t.Fatalf("stored thisUpdate %v", got)
+	}
+	// 번호는 크지만 thisUpdate 가 앞섬 -> 저장본
+	if pp, fb, err := v.withValid(dir, "rsync://h/repo/ca.mft", mk(10, base.Add(-time.Hour)), nil, okOld); err != nil || !fb || pp.mft.Number.Int64() != 9 {
+		t.Fatalf("thisUpdate back: %v %v", fb, err)
+	}
+	// 번호도 크고 thisUpdate 도 뒤 -> 새것
+	if pp, fb, err := v.withValid(dir, "rsync://h/repo/ca.mft", mk(10, base.Add(time.Hour)), nil, okOld); err != nil || fb || pp.mft.Number.Int64() != 10 {
+		t.Fatalf("forward: %v %v", fb, err)
+	}
+	// THISUPDATE 가 없는 옛 저장본 (0.4.0 전) = 번호만 비교
+	os.Remove(filepath.Join(dir, "THISUPDATE"))
+	if _, fb, err := v.withValid(dir, "rsync://h/repo/ca.mft", mk(11, base), nil, okOld); err != nil || fb {
+		t.Fatalf("old store: %v %v", fb, err)
+	}
+}
+
+// manifest 파일 이름이 바뀌면 경고 (RFC 9981 2), 폴더만 바뀌면 경고 없음, 직전 표가 없으면 비교 안 함
+func TestNoteMftName(t *testing.T) {
+	const what = "warn: manifest filename changed, manifest number reset (RFC 9981)"
+	v1 := newValidator("", time.Now(), 1)
+	v1.noteMftName(validCert("a", "", "rsync://h/repo/a.mft"))
+	v1.noteMftName(validCert("b", "", "rsync://h/repo/b.mft"))
+	if v1.count[what] != 0 {
+		t.Fatal("warned without previous run")
+	}
+	v2 := newValidator("", time.Now(), 1)
+	v2.PrevMftNames = v1.mftNames
+	v2.noteMftName(validCert("a", "", "rsync://h/repo/a2.mft")) // 이름 바뀜
+	v2.noteMftName(validCert("b", "", "rsync://h/new/b.mft"))   // 폴더만 바뀜
+	v2.noteMftName(validCert("c", "", "rsync://h/repo/c.mft"))  // 새 CA
+	if v2.count[what] != 1 {
+		t.Errorf("warnings %d, want 1", v2.count[what])
+	}
+	if ex := v2.warnEx[strings.TrimPrefix(what, "warn: ")]; len(ex) != 1 || ex[0] != "rsync://h/repo/a.mft -> rsync://h/repo/a2.mft" {
+		t.Errorf("example %v", ex)
 	}
 }

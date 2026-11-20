@@ -18,6 +18,7 @@ state = /var/lib/haetae/state        # lock, RTR session / serial, deltas, histo
 tal   =                              # empty = the 5 RIR TALs built into the binary (repo tals/)     option -tal
                                      #   give a folder only for an emergency TA key change
 slurm =                              # SLURM local exceptions file (RFC 8416). empty = none          option -slurm
+constraints =                        # TA constraints directory (<TAL name>.constraints, draft). empty = off (manual 7.6)   option -constraints
                                      #   e.g. /etc/haetae/slurm.json
 
 
@@ -35,6 +36,11 @@ hold-drop     = false                # on such a drop, keep serving the previous
 stale-warn    = 1h                   # warn / status stale / healthz 503 when the set is older          option -stale-warn
 max-start-age = 2h                   # on restart, serve the saved VRPs at once if newer (restart)   option -max-start-age
 
+
+[ccr]
+mode = off                           # CCR rpki.ccr (draft-ietf-sidrops-rpki-ccr) : off | latest (newest only) | daily | hourly | cycle (archive)   option -ccr
+keep = 168h                          # archive retention for daily / hourly / cycle (0 = keep forever)   option -ccr-keep
+dir  =                               # archive directory. empty = <out>/ccr                          option -ccr-dir
 
 [rtr]
 listen  = :3323                      # RTR address. empty = closed (restart)                         option -rtr

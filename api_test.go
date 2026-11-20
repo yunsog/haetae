@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 package main
 
 // api_test.go : 조회 API (AS / prefix / 대량 판정 / json-delta / unsafe / 객체 / 이력)
@@ -279,13 +281,24 @@ func TestHistory(t *testing.T) {
 	d.last = &runInfo{Start: time.Now(), Bytes: 1234567, Reason: "TA failed [ripe], keep previous"}
 	d.countNotApplied(d.last)
 	d.countNotApplied(&runInfo{Reason: "SLURM x: bad, keep previous"})
+	// 0.4.0 : 저장소별, RTR 판별 / 질의 수, HTTP 요청 수
+	okAt := time.Unix(1790000000, 0)
+	d.repos = []repoStatus{{URI: "https://a/n.xml", Type: "rrdp", Result: "ok", LastSuccess: &okAt},
+		{URI: "rsync://b/r", Type: "rsync", Result: "failed", Failures: 3}}
+	d.rtr = &rtrServer{St: d.st, Logf: testLogf(t)}
+	d.rtr.nSerial.Add(7)
 	d.mu.Unlock()
 	rec := httptest.NewRecorder()
 	d.apiHandler().ServeHTTP(rec, httptest.NewRequest("GET", "/metrics", nil))
 	body := rec.Body.String()
 	for _, want := range []string{"haetae_vrps 5", `haetae_build_info{goversion="`, `version="` + version + `"} 1`, "haetae_data_timestamp_seconds ",
 		`haetae_runs_not_applied_total{reason="ta_failed"} 1`, `haetae_runs_not_applied_total{reason="slurm"} 1`,
-		"haetae_last_run_downloaded_bytes 1234567", "haetae_handovers_total 0"} {
+		"haetae_last_run_downloaded_bytes 1234567", "haetae_handovers_total 0",
+		`haetae_repository_up{type="rrdp",uri="https://a/n.xml"} 1`, `haetae_repository_up{type="rsync",uri="rsync://b/r"} 0`,
+		`haetae_repository_consecutive_failures{type="rsync",uri="rsync://b/r"} 3`,
+		`haetae_repository_last_success_timestamp_seconds{type="rrdp",uri="https://a/n.xml"} 1790000000`,
+		`haetae_rtr_clients_by_version{version="2"} 0`, `haetae_rtr_queries_total{type="serial"} 7`, "haetae_rtr_refused_total 0",
+		`haetae_http_requests_total{access="forbidden"} `} {
 		if !strings.Contains(body, want) {
 			t.Errorf("metrics: no %q\n%s", want, body)
 		}

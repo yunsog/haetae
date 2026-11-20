@@ -249,7 +249,7 @@ minutes is fine.
 | `unsafe_vrps` | See [/api/v1/unsafe](#get-apiv1unsafe). Present after the first run. |
 | `rtr_open` | `true` only when every configured RTR listener (plain TCP and TLS) is open. A listener that failed to open (for example, port in use) is retried after each applied run. |
 | `stale` | `true` while the served set was validated longer ago than `-stale-warn` (default 1 hour; always `false` when it is 0). Checked every minute. See [GET /healthz](#get-healthz). |
-| `rtr_clients` | Connected routers, or `null`. `transport` is `tcp`, `tcp-md5`, `tcp-ao` or `tls`. `version` is the negotiated RTR version (`-1` before the first PDU). `serial` is the last serial sent. `trusted` is true for addresses in `rtr.trusted`. Routers connected over SSH appear as `127.0.0.1` with `tcp`. |
+| `rtr_clients` | Connected routers, or `null`. `transport` is `tcp`, `tcp-md5`, `tcp-ao`, `tls` or `ssh` (0.4.0). `version` is the negotiated RTR version (`-1` before the first PDU). `serial` is the last serial sent. `trusted` is true for addresses in `rtr.trusted`. Routers connected over SSH appear with their real address and `ssh` (0.4.0; before, as `127.0.0.1` with `tcp`). |
 | `tas` | Trust anchor certificates, the starting points for [/api/v1/ca](#get-apiv1cauri). |
 | `last_run` | The last run. `applied: false` means Haetae kept serving the previous set; `reason` says why (for example a failed TA or a VRP drop held by `-hold-drop`). `reason` can also carry a warning when `applied` is true (`WARNING VRP drop ...`). `failed_tas` lists TAs that failed. |
 | `last_run.counts` | Keys are `<type> valid` or `<type> rejected` (type = `cer crl mft roa asa gbr spl tak`), `warn: <message>`, and `unknown file type .<ext>` for non-standard files. |
@@ -372,6 +372,10 @@ start with `haetae_`.
 | `haetae_runs_not_applied_total` | `reason` | Runs not applied, by reason: `ta_failed`, `no_vrp`, `drop_held`, `tal`, `slurm` (counter) |
 | `haetae_rtr_open` | | RTR listener open (1 / 0) |
 | `haetae_rtr_clients` | | Connected RTR clients |
+| `haetae_rtr_clients_by_version` | `version` | Connected RTR clients by protocol version `0` / `1` / `2` (always present), `none` = no query yet (0.4.0) |
+| `haetae_rtr_queries_total` | `type` | RTR `reset` / `serial` queries from routers (counter, 0.4.0) |
+| `haetae_rtr_refused_total` | | RTR connections refused by connection limits (counter, 0.4.0) |
+| `haetae_http_requests_total` | `access` | HTTP requests by `internal` / `public` / `forbidden` (counter, 0.4.0) |
 | `haetae_vrps`, `haetae_vaps`, `haetae_router_keys` | | Served payload counts |
 | `haetae_data_timestamp_seconds` | | Validation time of served data (epoch) |
 | `haetae_data_age_seconds` | | Age of the served set since validation (seconds). Absent before the first set |
@@ -383,10 +387,15 @@ start with `haetae_`.
 | `haetae_objects` | `type`, `state` | Objects by type and `valid` / `rejected` |
 | `haetae_warnings` | `warning` | Warning counts |
 | `haetae_repositories` | `type`, `result` | Repositories by `rrdp` / `rsync` and result |
+| `haetae_repository_up` | `type`, `uri` | Per repository: fetched fresh in the last run (1), or failed / old data kept / backoff (0) (0.4.0) |
+| `haetae_repository_consecutive_failures` | `type`, `uri` | Per repository: consecutive failed runs since process start (0.4.0) |
+| `haetae_repository_last_success_timestamp_seconds` | `type`, `uri` | Per repository: last successful fetch since process start (epoch); absent before the first success (0.4.0) |
 | `haetae_unsafe_vrps` | | Unsafe VRPs |
 | `haetae_memory_rss_bytes` | | Resident memory |
 
 A useful alert: `haetae_data_age_seconds > 1800` (or `time() - haetae_data_timestamp_seconds > 1800`).
+Counters start from 0 at process start and after a seamless upgrade; `rate()` / `increase()` handle that.
+A Prometheus scrape example, alert rules and a Grafana dashboard are in `deploy/grafana/` (manual 10.1).
 
 ### Full VRP sets
 
@@ -398,6 +407,9 @@ first run has written a file, they return 404.
 
 rpki-client compatible JSON (`metadata`, `roas`, `aspas`, `bgpsec_keys`).
 Tools that read rpki-client's `json` output can read this file.
+The `ccr_*_hash` fields (0.4.0) are the SHA-256 hashes (base64) of the states in `rpki.ccr`,
+with the same names as rpki-client 9.9: equal hashes mean an equal validated cache state. They are present only
+when CCR output is on (`ccr.mode`, default off).
 
 ```json
 {
@@ -409,7 +421,9 @@ Tools that read rpki-client's `json` output can read this file.
 		"uniquevaps": 3914,
 		"bgpsec_keys": 3,
 		"failed_tals": null,
-		"counts": {"roa valid": 400374, "...": 0}
+		"counts": {"roa valid": 400374, "...": 0},
+		"ccr_mfts_hash": "PN3LZ8rK...", "ccr_vrps_hash": "VL0KvzYp...", "ccr_vaps_hash": "...",
+		"ccr_tas_hash": "...", "ccr_brks_hash": "..."
 	},
 	"roas": [
 		{ "asn": 13335, "prefix": "1.1.1.0/24", "maxLength": 24, "ta": "apnic", "expires": 1793500000 }
@@ -918,10 +932,11 @@ when a run is applied.
 | `objects.jsonl` | `/objects.jsonl` | Every object, one JSON record per line, URI order |
 | `rejects.txt` | `/rejects.txt` | `URI<TAB>reason` |
 | `repos.json` | `/repos.json` | Repository fetch results |
+| `rpki.ccr` | `/rpki.ccr` (internal only) | CCR, draft-ietf-sidrops-rpki-ccr-11 (DER, 0.4.0), when `ccr.mode` is not off (default off, 404). Same input gives the same bytes as rpki-client 9.9 |
 | `summary.txt` | (none) | Counts by type and warning, with a few examples per warning |
 
 Content types (0.2.0): `/json` and `/repos.json` = `application/json`, `/csv` = `text/csv`,
-`/objects.jsonl` = `application/jsonl`, `/rejects.txt` = `text/plain`. Range and
+`/objects.jsonl` = `application/jsonl`, `/rejects.txt` = `text/plain`, `/rpki.ccr` = `application/rpki-ccr`. Range and
 `If-Modified-Since` requests are supported.
 
 ### objects.jsonl
@@ -984,10 +999,13 @@ Sent by Haetae:
 | 11 | ASPA | v2 only. See below |
 
 Accepted from routers: Reset Query (2), Serial Query (1) and Error Report (10).
-Any other PDU type gets Error Report code 5 (Unsupported PDU Type). A PDU with
+A PDU type defined for the session's version but not sent by routers gets
+Error Report code 3 (Invalid Request, draft-ietf-sidrops-8210bis-29 section
+8.5); a type not defined for that version gets code 5 (Unsupported PDU Type). A PDU with
 a bad length (less than 8, more than 64 KiB, or the wrong fixed length for a
 query) gets code 0 (Corrupt Data). In every error case the connection is
-closed. An Error Report from a router is logged and the connection closed.
+closed. An Error Report from a router is logged and the connection closed,
+without any reply, even when its version is wrong.
 If no data is available (which only happens before RTR is normally opened), a
 query gets code 2 (No Data Available).
 
@@ -1115,7 +1133,7 @@ haetae -rtr-tls :3324 -rtr-tls-cert /etc/haetae/rtr.crt -rtr-tls-key /etc/haetae
        -rtr-tls-ca /etc/haetae/routers-ca.pem
 ```
 
-- TLS 1.2 or later.
+- TLS 1.3 only (RFC 9852 in BCP 195, cited by draft-ietf-sidrops-8210bis-29; 1.2 before 0.4.0).
 - With `-rtr-tls-ca`, routers must present a certificate signed by that CA.
   Without it, any router in `-rtr-allow` can connect.
 - `-rtr-allow` applies as for plain TCP.

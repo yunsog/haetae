@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 package main
 
 // validate.go : 검증 트리 (2 단계)
@@ -17,6 +19,7 @@ import (
 	"bytes"
 	"crypto/sha256"
 	"crypto/x509"
+	"errors"
 	"fmt"
 	"net/netip"
 	"os"
@@ -44,6 +47,8 @@ type caCtx struct {
 	Expires time.Time // 위 체인에서 가장 이른 만료
 	NotBef  time.Time // 위 체인에서 가장 늦은 시작 (인증서 notBefore, manifest / CRL thisUpdate)
 	Stale   time.Time // 위 체인의 manifest / CRL nextUpdate 중 가장 이른 것
+
+	ccr *ccrMft // 이 CA 의 manifest (CCR, ccr.go). processCA 가 채움, 아래 CA 의 SKI 를 processCert 가 더함
 }
 
 // chainTimes : CA 하나 아래 객체에 물려주는 체인 시각 (jsonext 의 chainValidity / stale)
@@ -115,6 +120,11 @@ type validator struct {
 	KeepCAs  bool     // 검증된 CA 를 SKI 로 모음 (RSC 체인 확인, rsc.go). 메모리 때문에 평소에는 끔
 	ValidDir string   // 직전 정상 publication point 저장 폴더 (valid.go). "" = 끔 (-validate 오프라인 비교)
 
+	Constraints map[string]*taConstraints // TA 이름 -> constraints (constraints.go). nil = 끔 (기본)
+	CCR         bool                      // rpki.ccr + json ccr_*_hash 를 씀 (ccr.go, 기본 끔)
+	// PrevMftNames : 직전 회차의 CA (공개 키 sha256) -> manifest URI (daemon 이 넘김, 읽기만). nil = 비교 안 함
+	PrevMftNames map[[32]byte]string
+
 	sem chan struct{}
 	wg  sync.WaitGroup
 
@@ -127,6 +137,7 @@ type validator struct {
 	objects   []objInfo
 	seenCA    map[string]bool        // CA 인증서 DER 의 sha256 -> 이미 처리 (같은 인증서 두 번 / 순환 방지)
 	validSeen map[string]bool        // 이번 회차에 본 직전 정상본 폴더 (나머지는 cleanValid 가 지움)
+	mftNames  map[[32]byte]string    // 이번 회차의 CA -> manifest URI (다음 회차의 PrevMftNames)
 	validLock map[string]*sync.Mutex // 직전 정상본 폴더마다 하나씩 (같은 폴더를 두 CA 가 동시에 쓰지 않게)
 	count     map[string]int         // 통계 (종류별 valid / rejected, 경고)
 	warnEx    map[string][]string    // 경고마다 예시 몇 개 (원인 확인용)
@@ -135,6 +146,10 @@ type validator struct {
 	taRepos   map[string]map[string]bool // TA -> 이번 회차에 쓴 저장소 열쇠 (maxReposPerTA, repo_guard.go)
 
 	ppBudget *byteBudget // 동시에 메모리에 올린 publication point 바이트 (maxPPInFlight)
+
+	ccrMfts []*ccrMft // CCR (ccr.go) : 확인을 통과한 manifest
+	ccrTAs  [][]byte  // CCR : 쓴 TA 인증서의 SKI
+	ccrDER  []byte    // 이번 회차의 CCR (writeOutputs 가 만들고 daemon 이 보관한 뒤 비움)
 }
 
 // publication point 하나 (manifest + 나열된 파일) 의 바이트 상한과, 동시에 메모리에 올리는 합 (11-05 검토 12).
@@ -185,6 +200,7 @@ func newValidator(cacheDir string, now time.Time, workers int) *validator {
 		aspas:     map[aspaKey]*aspaOut{},
 		seenCA:    map[string]bool{},
 		validSeen: map[string]bool{},
+		mftNames:  map[[32]byte]string{},
 		validLock: map[string]*sync.Mutex{},
 		taRepos:   map[string]map[string]bool{},
 		ppBudget:  newByteBudget(maxPPInFlight),
@@ -214,6 +230,9 @@ func (v *validator) run(tals []*tal) {
 			continue
 		}
 		v.warnSKI(ta, uri)
+		v.mu.Lock()
+		v.ccrTAs = append(v.ccrTAs, ta.SKI)
+		v.mu.Unlock()
 		v.valid("cer", uri, t.Name, "", ta.X509.Raw, ta.X509.NotBefore, ta.X509.NotAfter,
 			map[string]any{"kind": "TA", "repository": ta.CARepository, "notify": ta.Notify, "resources": newResSummary(ta.IPs, ta.ASs)})
 		v.spawn(caCtx{Cert: ta, URI: uri, TA: t.Name, IPs: ta.IPs, ASs: ta.ASs,
@@ -507,6 +526,10 @@ func (v *validator) processCA(ctx caCtx) {
 	}
 	defer pp.done() // 나열된 파일을 다 쓴 뒤 바이트 예산을 돌려줌
 	mft, crl, crlURI, files := pp.mft, pp.crl, pp.crlURI, pp.files
+	ctx.ccr = newCCRMft(pp.mftDER, mft)
+	v.mu.Lock()
+	v.ccrMfts = append(v.ccrMfts, ctx.ccr)
+	v.mu.Unlock()
 	if v.KeepCAs {
 		v.mu.Lock()
 		if v.caBySKI == nil {
@@ -566,8 +589,22 @@ func (v *validator) publicationPoint(ctx *caCtx) (*pubPoint, bool, error) {
 	if v.ValidDir == "" {
 		return pp, false, err
 	}
+	v.noteMftName(c)
 	dir := validPPDir(v.ValidDir, c)
 	return v.withValid(dir, c.Manifest, pp, err, func() (*pubPoint, error) { return v.loadPublicationPoint(ctx, validAt(dir), nil) })
+}
+
+// noteMftName : CA 마다 manifest URI 를 적고, 직전 회차와 파일 이름 (URI 마지막 칸) 이 다르면 경고.
+// RFC 9981 2 : 이름이 바뀌면 manifest 번호를 처음부터 셈 (저장본 폴더가 manifest URI 마다 따로라 저절로 됨) + 운영자에게 알림.
+// 재시작 / 판 올리기 뒤 첫 회차는 직전 표가 없어 비교하지 않음
+func (v *validator) noteMftName(c *rpkiCert) {
+	k := sha256.Sum256(c.X509.RawSubjectPublicKeyInfo)
+	v.mu.Lock()
+	v.mftNames[k] = c.Manifest
+	v.mu.Unlock()
+	if old, ok := v.PrevMftNames[k]; ok && path.Base(old) != path.Base(c.Manifest) {
+		v.warn("manifest filename changed, manifest number reset (RFC 9981)", old+" -> "+c.Manifest)
+	}
 }
 
 // withValid : 새로 받은 것 (pp, err) 과 저장본 (dir, loadOld 로 다시 검증) 중 쓸 것을 고르고, 새것이 맞으면 저장
@@ -599,20 +636,22 @@ func (v *validator) withValid(dir, mftURI string, pp *pubPoint, err error, loadO
 		}
 		return pp, false, err
 	}
-	back := err == nil && pp.mft.Number.Cmp(prev) < 0
-	if err == nil && !back {
+	back := ""
+	if err == nil {
+		back = mftWentBack(pp.mft, prev, storedThisUpdate(dir))
+	}
+	if err == nil && back == "" {
 		store()
 		return pp, false, nil
 	}
 	old, oerr := loadOld()
-	if back {
+	if back != "" {
 		if oerr != nil {
-			v.warn("manifest number went back, previous copy no longer valid: accepted",
-				fmt.Sprintf("%s: %s < %s", mftURI, pp.mft.Number, prev))
+			v.warn("manifest went back, previous copy no longer valid: accepted", mftURI+": "+back)
 			store()
 			return pp, false, nil
 		}
-		err = fmt.Errorf("manifest number %s lower than previous %s", pp.mft.Number, prev)
+		err = errors.New(back)
 	}
 	if oerr != nil {
 		return nil, false, fmt.Errorf("%w (previous valid copy: %v)", err, oerr)
@@ -678,8 +717,10 @@ func (v *validator) loadPublicationPoint(ctx *caCtx, at func(uri string) (string
 	if v.Now.After(mft.NextUpdate) {
 		return nil, fmt.Errorf("manifest is stale (nextUpdate %s)", mft.NextUpdate.Format(time.RFC3339))
 	}
+	// RFC 9981 4 : manifest 의 signedObject 가 받은 위치 (CA 의 rpkiManifest = 캐시에서 읽은 곳) 와 다르면
+	// 수집 실패로 봄 -> withValid 가 직전 정상본 (RFC 9286 6.6). 다른 곳의 manifest 를 옮겨 놓은 재생 공격 방지
 	if ee.SignedObject != c.Manifest {
-		v.warn("manifest EE signedObject does not match location", c.Manifest)
+		return nil, fmt.Errorf("manifest EE signedObject %s does not match location", ee.SignedObject)
 	}
 	v.warnSKI(ee, c.Manifest)
 
@@ -801,12 +842,20 @@ func (v *validator) processCert(ctx *caCtx, crl *rpkiCRL, crlURI string, f mftEn
 			v.rejectCert(f.URI, ctx.TA, ctx.URI, fmt.Errorf("self-signed certificate below TA"), c, "")
 			return
 		}
+		if ctx.ccr != nil {
+			v.mu.Lock()
+			ctx.ccr.Subs = append(ctx.ccr.Subs, c.SKI)
+			v.mu.Unlock()
+		}
 		v.valid("cer", f.URI, ctx.TA, ctx.URI, f.Data, c.X509.NotBefore, c.X509.NotAfter,
 			map[string]any{"kind": "CA", "repository": c.CARepository, "notify": c.Notify, "resources": newResSummary(ips, as)})
 		v.spawn(caCtx{Cert: c, URI: f.URI, TA: ctx.TA, Depth: ctx.Depth + 1, IPs: ips, ASs: as,
 			Expires: exp, NotBef: maxTime(ch.NB, c.X509.NotBefore), Stale: ch.Stale})
 	case kindRouter:
 		keys, err := c.routerKeys()
+		if err == nil {
+			err = v.Constraints[ctx.TA].check(c)
+		}
 		if err != nil {
 			v.rejectCert(f.URI, ctx.TA, ctx.URI, err, c, "")
 			return
@@ -879,6 +928,9 @@ func (v *validator) processSigned(ctx *caCtx, crl *rpkiCRL, crlURI string, f mft
 	}
 	if err == nil && roa != nil {
 		err = roaCovered(roa, ips)
+	}
+	if err == nil && (roa != nil || aspa != nil || ext == "spl") {
+		err = v.Constraints[ctx.TA].check(so.EE) // TA constraints (끔이면 nil = 통과)
 	}
 	if err != nil {
 		v.reject(ext, f.URI, ctx.TA, ctx.URI, err)

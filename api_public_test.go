@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 package main
 
 // api_public_test.go : 내부 / 공개 / 403 나누기, 공개 쪽 상태에서 내부 정보 빠짐, 공개 쪽 큰 파일 제한, 연결 수 상한

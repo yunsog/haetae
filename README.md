@@ -9,7 +9,7 @@ result to routers over RTR and to other systems over an HTTP API.
 The name comes from the *haetae* (해태), a mythical guardian in Korean tradition
 that tells right from wrong. This one checks whether a route is telling the truth.
 
-Haetae 0.3.0 runs in a test deployment alongside other RPs, serving a test router
+Haetae 0.4.0 runs in a test deployment alongside other RPs, serving a test router
 over RTR. It is new software: please run it next to an established RP and compare
 before relying on it.
 
@@ -23,12 +23,13 @@ before relying on it.
   time / depth limits, back-off for dead repositories.
 - **Validation** : RFC 6487 / 3779 / 6488 / 9286 / 9582, rpki-client level
   strictness, manifest-based publication point handling with the last valid
-  copy as fallback (RFC 9286 section 6.7). TA constraints
-  (draft-ietf-sidrops-constraining-rpki-trust-anchors) are not implemented yet.
+  copy as fallback (RFC 9286 section 6.7). Optional TA constraints
+  (draft-ietf-sidrops-constraining-rpki-trust-anchors, off by default).
 - **RTR** : RFC 8210 version 1 (with version 0 negotiation and Router Key PDUs)
-  and version 2 (ASPA PDUs, draft-ietf-sidrops-8210bis). Session and serial are
+  and version 2 (ASPA PDUs, draft-ietf-sidrops-8210bis-29). Session and serial are
   kept across restarts. Transport security : TCP-MD5, TCP-AO, TLS, SSH subsystem.
-- **HTTP API** : rpki-client style JSON, CSV, Routinator style `json-delta`,
+- **HTTP API** : rpki-client style JSON, CSV, CCR (`rpki.ccr`,
+  draft-ietf-sidrops-rpki-ccr), Routinator style `json-delta`,
   validity lookup, AS / prefix queries, ASPA path verification, object listing,
   status, `/healthz` and Prometheus metrics. Two access tiers: management
   networks see everything, the public only the lookup paths.
@@ -40,8 +41,19 @@ before relying on it.
   RTR pauses for about 2 seconds.
 - **No dependencies** : Go standard library only.
 
+Drafts followed (revision checked against the code on 2026-11-18):
+draft-ietf-sidrops-8210bis-29, aspa-profile-31, aspa-verification-29,
+rpki-ccr-11, rpki-prefixlist-05, aspa-slurm-04,
+constraining-rpki-trust-anchors-02 and prefer-rrdp-02 (all `draft-ietf-sidrops-`).
+
 On the same repository snapshot and validation time, Haetae and rpki-client
-(9.0 and 9.9) produce the same VRPs, ASPAs and router keys.
+(9.0 and 9.9) produce the same VRPs and router keys. ASPAs are the same except
+for one difference: when ASPAs for one customer AS are merged, Haetae removes
+AS0 if other providers are present, as draft-ietf-sidrops-aspa-profile
+section 5.2 requires (as Routinator 0.16 does); rpki-client 9.9 keeps it, and
+its OpenBSD source changed this on 2026-11-16, so the next release should
+agree. The
+CCR states other than ASPA are byte for byte the same.
 
 ## Download
 
@@ -49,10 +61,10 @@ Each [release](https://github.com/yunsog/haetae/releases) has static Linux
 binaries for amd64 and arm64 (no dependencies, the TALs are built in):
 
 ```
-curl -LO https://github.com/yunsog/haetae/releases/download/v0.3.0/haetae-0.3.0-linux-amd64
-curl -LO https://github.com/yunsog/haetae/releases/download/v0.3.0/SHA256SUMS
+curl -LO https://github.com/yunsog/haetae/releases/download/v0.4.0/haetae-0.4.0-linux-amd64
+curl -LO https://github.com/yunsog/haetae/releases/download/v0.4.0/SHA256SUMS
 sha256sum -c --ignore-missing SHA256SUMS
-install -m 755 haetae-0.3.0-linux-amd64 haetae
+install -m 755 haetae-0.4.0-linux-amd64 haetae
 ```
 
 Haetae uses the `rsync` command as a fallback when RRDP fails (or set
@@ -71,7 +83,7 @@ or from a clone :
 ```
 git clone https://github.com/yunsog/haetae.git
 cd haetae
-go build -o haetae .
+CGO_ENABLED=0 go build -o haetae .
 go test ./...
 ```
 
@@ -94,10 +106,11 @@ For a systemd installation see `deploy/haetae.service`,
 - [API guide](docs/api.md) : HTTP API and RTR
 - [Trust anchors](tals/README.md)
 - [Changes](CHANGELOG.md)
-- Introduction slides : [English](docs/haetae_v0.3_en.pdf), [Korean](docs/haetae_v0.3_ko.pdf)
+- Introduction slides : [English](docs/haetae_v0.4_en.pdf), [Korean](docs/haetae_v0.4_ko.pdf)
 
 Source code comments, command line help and some log messages are in Korean.
 
 ## License
 
-ISC. See [LICENSE](LICENSE).
+Apache License 2.0. See [LICENSE](LICENSE) and [NOTICE](NOTICE).
+Releases 0.3.0 and earlier remain under the ISC license.

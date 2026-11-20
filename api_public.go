@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 package main
 
 // api_public.go : HTTP 접근 두 단계 (0.2.0, [http] public)
@@ -17,6 +19,7 @@ import (
 	"net/netip"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -36,6 +39,15 @@ var httpWriteIdle = 60 * time.Second // 시험에서 줄임
 
 const httpWriteChunk = 256 << 10
 
+// httpRequests : /metrics 의 HTTP 요청 수 (0.4.0). 내부 / 공개 / 403 별, 프로세스 시작부터
+var httpRequests [3]atomic.Uint64
+
+const (
+	httpInternal = iota
+	httpPublic
+	httpForbidden
+)
+
 // httpAccess : 출발지 주소로 내부 / 공개 / 403 을 가름. 목록은 요청마다 불러 지금 값 (reload 로 바뀜)
 func httpAccess(allow, public func() *[]netip.Prefix, full, pub http.Handler) http.Handler {
 	in := func(get func() *[]netip.Prefix, ip netip.Addr) bool { return prefixesContain(get(), ip) }
@@ -45,13 +57,16 @@ func httpAccess(allow, public func() *[]netip.Prefix, full, pub http.Handler) ht
 			ip := ap.Addr().Unmap()
 			switch {
 			case in(allow, ip):
+				httpRequests[httpInternal].Add(1)
 				full.ServeHTTP(w, r)
 				return
 			case public != nil && in(public, ip):
+				httpRequests[httpPublic].Add(1)
 				pub.ServeHTTP(w, r)
 				return
 			}
 		}
+		httpRequests[httpForbidden].Add(1)
 		http.Error(w, "forbidden", http.StatusForbidden)
 	})
 }

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 package main
 
 // repo_guard_test.go : 저장소 수집 제한 (11-05 검토 10 / 11 / 12)

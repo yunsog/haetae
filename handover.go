@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 package main
 
 // handover.go : 무중단 판 올리기 (0.2.0, 11-02. 봉수대 handover.go 와 같은 방식, docs/manual.md 6.9)
@@ -40,12 +42,13 @@ import (
 )
 
 const (
-	handoverVersion   = 1                // 상태 파일 형식 판. 다르면 판 올리기를 하지 않음 (그때는 재시작)
-	handoverCycleWait = 15 * time.Minute // 돌던 회차를 기다리는 최대 (평소 1 ~ 3 분)
-	handoverParkWait  = 2 * time.Minute  // RTR 연결이 하던 응답을 끝내길 기다리는 최대 (전체 전송 약 20 초)
-	handoverHTTPWait  = 30 * time.Second // HTTP 하던 요청
-	handoverCheckWait = 30 * time.Second // 새 실행 파일 확인
-	handoverFile      = "handover.gob"   // 상태 폴더 안
+	handoverVersion    = 1                     // 상태 파일 형식 판. 다르면 판 올리기를 하지 않음 (그때는 재시작)
+	handoverCycleWait  = 15 * time.Minute      // 돌던 회차를 기다리는 최대 (평소 1 ~ 3 분)
+	handoverParkWait   = 2 * time.Minute       // RTR 연결이 하던 응답을 끝내길 기다리는 최대 (전체 전송 약 20 초)
+	handoverHTTPWait   = 30 * time.Second      // HTTP 하던 요청
+	handoverCheckWait  = 30 * time.Second      // 새 실행 파일 확인
+	handoverTermSettle = 50 * time.Millisecond // exec 직전 : 이미 받은 SIGTERM 이 watchTerm 에 닿을 시간 (B5)
+	handoverFile       = "handover.gob"        // 상태 폴더 안
 )
 
 // handoverState : 옛 판 -> 새 판 (gob)
@@ -342,8 +345,33 @@ func (d *daemon) handover() (err error) {
 	// 6. exec : 같은 pid, 같은 환경 (NOTIFY_SOCKET / WATCHDOG_USEC 그대로), 옵션 + -resume
 	args := append([]string{os.Args[0]}, baseArgs()...)
 	args = append(args, "-resume", path)
+	// SIGTERM 과 exec 가 엇갈리지 않게 (B5, 11-12 재현) : 전에는 위 2 의 stopping 확인 뒤에 온 SIGTERM 을 옛 판이 받아
+	// RTR 을 닫는 사이 exec 되면 새 판은 종료 요청을 모른 채 계속 돎 (systemd 가 기다리다 SIGKILL).
+	//  1) handoverTermSettle 만큼 기다림 : 이미 Go 가 받은 신호가 watchTerm 에 닿아 termSeen 이 켜질 시간
+	//  2) d.mu 를 쥐고 termSeen / stopping 확인 -> 켜졌으면 판 올리기를 그만둠 (옛 판이 정리하고 끝)
+	//  3) SIGTERM / SIGINT 를 기본 동작으로 되돌림 (Reset) : 지금부터 오는 것은 이 자리에서 프로세스를 끝냄
+	//  4) d.mu 를 쥔 채 exec
+	// 순서 주의 : Reset 을 확인보다 먼저 하면, Go 가 받아 두고 아직 채널로 넘기지 않은 신호를 Reset 이 버림
+	// (시험에서 그 순서로 96 번 중 1 번 놓침). 남는 틈 = 2) 확인 ~ 3) Reset 사이 (수십 마이크로초).
+	// 새 판은 시작하자마자 SIGTERM 을 다시 받음 (daemon.go). 그 전에 오면 Go 기본 동작 = 끝 (systemd stop 그대로)
+	time.Sleep(handoverTermSettle)
+	d.mu.Lock()
+	if d.stopping || d.termSeen.Load() {
+		d.mu.Unlock()
+		return errors.New("stopping (SIGTERM during handover)")
+	}
+	signal.Reset(syscall.SIGTERM, syscall.SIGINT)
 	err = syscall.Exec(d.exe, args, os.Environ())
+	d.mu.Unlock()
+	d.renotifyTerm()
 	return fmt.Errorf("exec %s : %w", d.exe, err) // 여기 오면 exec 실패
+}
+
+// renotifyTerm : exec 를 그만두면 SIGTERM / SIGINT 를 다시 watchTerm 으로
+func (d *daemon) renotifyTerm() {
+	if d.termCh != nil {
+		signal.Notify(d.termCh, syscall.SIGTERM, syscall.SIGINT)
+	}
 }
 
 // dupFd : 소켓 / 파일의 fd 복사 (dup 은 CLOEXEC 를 붙이지 않음). 원래 fd 는 Go 가 그대로 씀
@@ -532,6 +560,7 @@ func (hs *handoverState) resumeRTR(d *daemon, have bool) {
 		}
 		rc := &rtrConn{srv: d.rtr, c: c, remote: s.Remote, slot: slot, trans: s.Trans, w: bufio.NewWriterSize(c, 64*1024),
 			since: s.Since, lastFull: s.LastFull, pending: s.Pending, resumed: true}
+		rc.proxyOK = s.Ver < 0 && proxyAllowed(s.Remote, s.Trans) // 첫 PDU 전에 넘어온 -rtr-stdio 연결 (B8)
 		rc.ver.Store(s.Ver)
 		rc.lastQ.Store(s.LastQ)
 		rc.sentSer.Store(s.SentSer)

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 package main
 
 // api_query.go : 조회 API (docs/api.md 와 같게 유지)
@@ -269,7 +271,7 @@ func (d *daemon) handleJSONDelta(w http.ResponseWriter, r *http.Request) {
 	to := ser
 	if s := q.Get("to"); s != "" {
 		n, err := strconv.ParseUint(s, 10, 32)
-		if err != nil || uint32(n) > ser {
+		if err != nil || !serialLE(uint32(n), ser) {
 			d.st.mu.RUnlock()
 			http.Error(w, "bad to (must be <= current serial)", 400)
 			return
@@ -282,7 +284,7 @@ func (d *daemon) handleJSONDelta(w http.ResponseWriter, r *http.Request) {
 	aspaTo := map[uint32][]uint32{} // to 시점의 provider (비었으면 없음)
 	ok := false
 	from, err := strconv.ParseUint(q.Get("serial"), 10, 32)
-	if err == nil && q.Get("session") == strconv.Itoa(int(ses)) && uint32(from) <= to {
+	if err == nil && q.Get("session") == strconv.Itoa(int(ses)) && serialLE(uint32(from), to) {
 		ann, wdr, kAnn, kWdr, aspaChg, ok = d.st.netDiffTo(uint32(from), to)
 		for _, c := range aspaChg {
 			aspaTo[c] = d.st.aspaAt(c, to)

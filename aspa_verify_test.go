@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 package main
 
 // aspa_verify_test.go : ASPA 경로 검증 (오르막 / 내리막, 앞 단계, API)

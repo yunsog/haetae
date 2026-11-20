@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 package main
 
 // roa.go : ROA (RFC 9582) -> VRP

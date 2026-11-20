@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 package main
 
 // config_test.go : 설정 파일 읽기 (deploy/haetae.conf.example, 운영 deploy/haetae.conf 가 실제 옵션에 다 맞는지 포함)
