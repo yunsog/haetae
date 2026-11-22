@@ -13,6 +13,20 @@ Haetae 0.4.0 runs in a test deployment alongside other RPs, serving a test route
 over RTR. It is new software: please run it next to an established RP and compare
 before relying on it.
 
+## How it was built
+
+Haetae is a personal project, built by one person in their own time, not for
+an employer. The code was written with an LLM coding agent, used heavily
+throughout. The author directed the work and made the design decisions, and
+without the agent would not have attempted an RP alone.
+
+Haetae is an independent implementation. It was written from the RFCs and
+Internet-Drafts, and no other relying party's source code was consulted.
+rpki-client and Routinator are used only as black-box references: Haetae's
+output is compared with rpki-client's on fixed repository snapshots, and with
+both every day on live data. On the reference snapshot (2026-10-29) the VRPs
+are identical to those of rpki-client 9.9.
+
 ## Features
 
 - **Objects** : TA / CA certificates, CRLs, manifests, ROAs, ASPA, BGPsec router
